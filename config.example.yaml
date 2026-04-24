@@ -1,0 +1,10 @@
+# khonliang-store config — copy to config.yaml and edit locally.
+# config.yaml is git-ignored; machine-specific paths and tokens go here.
+
+# Bus URL this agent registers with.
+bus_url: http://localhost:8788
+
+# Local filesystem path for the store agent's artifact backend. Not yet
+# used by Phase 1 (scaffold-only) — future FRs that add artifact
+# skills will write here.
+data_path: data/

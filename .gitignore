@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# Local config + runtime state — per khonliang convention, these carry
+# machine-specific paths and must not be committed. The example file
+# (`config.example.yaml`) is the template.
+config.yaml
+data/
+logs/

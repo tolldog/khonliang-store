@@ -1,0 +1,22 @@
+[project]
+name = "khonliang-store"
+version = "0.1.0"
+description = "Bus-native store agent — artifact backend and viewer mode (Phase 1: scaffold)"
+requires-python = ">=3.11"
+dependencies = [
+    "khonliang-bus-lib",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+
+[project.scripts]
+khonliang-store = "store.agent:main"
+
+[tool.setuptools.packages.find]
+include = ["store*"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
