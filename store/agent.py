@@ -1,11 +1,14 @@
 """Store agent — Phase 1 scaffold.
 
 Registers on the bus with the minimum needed to be a participant:
-nothing but the inherited ``health_check`` skill from
-:class:`khonliang_bus.BaseAgent`. The point of this phase is to
-establish the repo, the install/uninstall CLI pattern, and the
-registration surface so follow-up FRs can add real skills one at a
-time without re-litigating the scaffolding.
+the subclass declares zero skills. The built-in ``health_check``
+handler inherited from :class:`khonliang_bus.BaseAgent` stays
+dispatchable (routed through ``_handlers``) for liveness probes, but
+is not listed in the bus's advertised skill set — that set comes
+from ``register_skills()`` which returns ``[]`` here. The point of
+this phase is to establish the repo, the install/uninstall CLI
+pattern, and the registration surface so follow-up FRs can add real
+skills one at a time without re-litigating the scaffolding.
 
 Current scope (``fr_store_4ea7d48b``):
     - Class exists, subclass of :class:`BaseAgent`, ``agent_type = "store"``.
