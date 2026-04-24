@@ -62,8 +62,11 @@ class StoreAgent(BaseAgent):
 def main() -> None:
     from khonliang_bus import add_version_flag
 
+    # Omit `prog` so argparse derives it from argv[0]. The package
+    # installs a `khonliang-store` console script AND is runnable via
+    # `python -m store.agent`; hard-coding one name makes the
+    # --help output misleading when invoked via the other path.
     parser = argparse.ArgumentParser(
-        prog="store.agent",
         description="khonliang-store bus agent",
     )
     add_version_flag(parser)
