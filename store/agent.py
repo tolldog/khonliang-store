@@ -31,7 +31,7 @@ Usage::
     python -m store.agent --id store-primary --bus http://localhost:8788 --config config.yaml
 
     # Uninstall
-    python -m store.agent uninstall --id store-primary --bus http://localhost:8788
+    python -m store.agent uninstall --id store-primary --bus http://localhost:8788 --config config.yaml
 """
 
 from __future__ import annotations
@@ -42,9 +42,6 @@ import logging
 import sys
 
 from khonliang_bus import BaseAgent
-
-
-logger = logging.getLogger(__name__)
 
 
 class StoreAgent(BaseAgent):

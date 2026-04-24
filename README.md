@@ -6,11 +6,15 @@ of a browser-based viewer mode for rendered artifacts.
 
 ## Status — Phase 1 (scaffold)
 
-Registered-but-empty shell. The agent connects to the bus, advertises
-the inherited `health_check` skill, and nothing else. Real
-functionality lands in follow-up FRs one skill at a time so the
-infrastructure work (repo, pyproject, tests, CLI) doesn't get
-re-litigated every round.
+Registered-but-empty shell. The agent connects to the bus and
+declares no subclass skills yet. The inherited `health_check`
+handler from `BaseAgent` remains dispatchable for liveness probes,
+but is not listed in `registration.skills` — the test harness builds
+registration from the subclass's `register_skills()` return, which
+skips `BaseAgent.BUILT_IN_SKILLS`. Real functionality lands in
+follow-up FRs one skill at a time so the infrastructure work
+(repo, pyproject, tests, CLI) doesn't get re-litigated every
+round.
 
 Tracked under `fr_store_4ea7d48b`. Sibling FR `fr_store_d22556bb`
 covers the viewer mode once artifact read skills are in place.
