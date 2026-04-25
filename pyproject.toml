@@ -1,7 +1,7 @@
 [project]
 name = "khonliang-store"
-version = "0.1.0"
-description = "Bus-native store agent — artifact backend and viewer mode (Phase 1: scaffold)"
+version = "0.3.0"
+description = "Bus-native store agent — display(artifacts) browser viewer (Phase 3); artifact-ownership migration follows"
 requires-python = ">=3.11"
 dependencies = [
     "khonliang-bus-lib",

@@ -1,16 +1,22 @@
 # khonliang-store
 
 Bus-native store agent. Eventual owner of the artifact backend and
-host of a browser-based viewer mode. **Phase 1 is scaffold-only** —
-registered-but-empty shell. Don't add artifact or viewer functionality
-to this repo without a specific FR scoping the addition; the
-phased-landing convention is the reason the scaffold PR exists.
+host of a browser-based viewer mode. The phased-landing convention
+is preserved — **don't bundle Phase 2 (artifact read skills) into a
+Phase 4 (write ownership) PR or vice versa**. Each phase is its own
+FR with its own PR.
 
 ## Status
 
-Alive as a bus agent. Inherits `health_check` from `BaseAgent`; has
-no skills of its own yet. See `fr_store_4ea7d48b` (Phase 1 scaffold)
-and `fr_store_d22556bb` (viewer mode follow-up).
+Phase 3 viewer landed (`fr_store_d22556bb`): `display(artifacts,
+layout='tabs')` lazily starts an in-process HTTP viewer, pre-fetches
+artifacts via the bus, and returns a browser URL. Renderers are
+extensible via `@register_renderer("type/x")`.
+
+Phases 2 (artifact reads owned by store) and 4 (write ownership +
+bus surface deprecation) remain open. The viewer reads from the bus
+today and swaps to a local backend without renderer/server changes
+when Phase 4 lands.
 
 ## Stack
 
@@ -53,23 +59,27 @@ When in doubt: if it's about *storing, reading, rendering, or
 displaying an artifact*, it belongs here eventually. Today, nothing
 belongs here yet.
 
-## Phase roadmap (not yet in scope)
+## Phase roadmap
 
 Each phase is its own FR. Do not stack them into a single PR — the
-smaller-PR convention is the reason the scaffold is empty.
+smaller-PR convention is what kept the scaffold separate from the
+viewer skill.
 
-1. **Phase 1 (this PR)** — scaffold, health_check, tests, CLI.
+1. **Phase 1** ✅ shipped — scaffold, health_check, tests, CLI
+   (`fr_store_4ea7d48b`).
 2. **Phase 2** — artifact read skills (get, list, metadata, head,
-   tail, grep, excerpt). Proxy to the bus artifact backend initially.
-3. **Phase 3** — viewer mode (`fr_store_d22556bb`). Browser URL for
-   tabbed/split rendering. Graphviz, markdown, JSON tree, code
-   highlighting.
+   tail, grep, excerpt). Proxy to the bus artifact backend
+   initially. _Open._
+3. **Phase 3** ✅ shipped — viewer mode (`fr_store_d22556bb`).
+   Browser URL for tabbed/split rendering. Graphviz, markdown, JSON
+   tree, code highlighting; renderer registry extensible via
+   `@register_renderer`.
 4. **Phase 4** — artifact write skills + ownership migration. The
    store agent becomes the write path; the bus artifact surface
-   becomes a read-proxy or is removed.
+   becomes a read-proxy or is removed. _Open._
 5. **Phase 5** — cross-reference from fr_researcher_000ad07c
    (`stage_payload` / `ingest_from_artifact`) once store owns the
-   write path.
+   write path. _Open._
 
 ## Running
 

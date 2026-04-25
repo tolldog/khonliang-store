@@ -1,29 +1,20 @@
-"""Store agent — Phase 1 scaffold.
+"""Store agent — Phase 1 scaffold + Phase 3 viewer skill.
 
-Registers on the bus with the minimum needed to be a participant:
-the subclass declares zero skills. The built-in ``health_check``
-handler inherited from :class:`khonliang_bus.BaseAgent` stays
-dispatchable (routed through ``_handlers``) for liveness probes, but
-is not listed in the bus's advertised skill set — that set comes
-from ``register_skills()`` which returns ``[]`` here. The point of
-this phase is to establish the repo, the install/uninstall CLI
-pattern, and the registration surface so follow-up FRs can add real
-skills one at a time without re-litigating the scaffolding.
+Phase 1 (``fr_store_4ea7d48b``) shipped the registered-but-empty
+shell: subclass of :class:`BaseAgent`, ``agent_type = "store"``,
+install/uninstall CLI matching the developer and reviewer pattern.
+Phase 3 (``fr_store_d22556bb``) adds the first real skill,
+``display(artifacts)``, which lazily starts an HTTP viewer in a
+worker thread and returns a URL the caller can open in a browser.
 
-Current scope (``fr_store_4ea7d48b``):
-    - Class exists, subclass of :class:`BaseAgent`, ``agent_type = "store"``.
-    - ``main()`` supports ``install`` / ``uninstall`` / run, matching
-      the developer and reviewer agents.
-    - Tests cover registration metadata + the built-in health_check.
+Phase 2 (artifact read skills) is intentionally still pending — the
+viewer reads artifact bytes via the bus today (see ``_fetch_via_bus``)
+so the user-facing surface ships before the read-skill migration.
 
-Future scope (separate FRs):
-    - Artifact read skills: get, list, metadata, head, tail, grep,
-      excerpt. Matches the shape of the current ``bus_artifact_*``
-      surface.
-    - Artifact write skills: stage_payload, replace, delete.
-    - Viewer mode (``fr_store_d22556bb``): ``display(artifacts)`` →
-      ephemeral browser URL with tabbed/split layouts.
-    - Migration path away from the bus-owned artifact backend.
+Current skill surface:
+    - ``health_check`` — inherited from :class:`BaseAgent`.
+    - ``display(artifacts, layout='tabs')`` — lazy-start viewer,
+      register tabs, return ``{url, session_id, tab_ids}``.
 
 Usage::
 
@@ -41,22 +32,213 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
+from typing import Any, Tuple
 
-from khonliang_bus import BaseAgent
+from khonliang_bus import BaseAgent, Skill, handler
+
+from store.viewer import ArtifactRef, PreparedTab, display as viewer_display
+
+
+# Cap on parallel artifact fetches per display() call. Tuned for
+# "interactive viewer call against a single bus" rather than batch
+# ingest — pick something low enough that a 50-tab display doesn't
+# burst into 50 simultaneous bus requests, but high enough that
+# latency-bound (rather than CPU-bound) fetches don't serialize.
+_FETCH_CONCURRENCY = 8
 
 
 class StoreAgent(BaseAgent):
-    """Bus-native store agent (Phase 1: scaffold only).
+    """Bus-native store agent.
 
-    No skills of its own — inherits ``health_check`` from
-    :class:`BaseAgent`. Subsequent FRs add artifact + viewer surfaces.
+    Phase-1 scaffold (`fr_store_4ea7d48b`) plus Phase-3 viewer
+    surface (`fr_store_d22556bb`). Artifact read/write skills land
+    in subsequent phases; today the viewer fetches artifact bytes
+    from the bus.
     """
 
     agent_id = "store-primary"
     agent_type = "store"
     module_name = "store.agent"
+
+    def register_skills(self) -> list[Skill]:
+        return [
+            Skill(
+                "display",
+                "Open (or reuse) the in-process viewer and register "
+                "the supplied artifacts as tabs. Returns the viewer URL "
+                "plus the new session_id and tab_ids. Renders by "
+                "content_type — markdown, JSON, graphviz, code, plain "
+                "text — extensible by registering new renderers.",
+                {
+                    "artifacts": {
+                        # The handler accepts either a JSON-encoded
+                        # string or a structured list (objects of
+                        # {id, view_hint?} or bare id strings).
+                        # Advertised as 'string|list' so bus clients
+                        # that pass structured args don't trip a
+                        # client-side validator that only expected
+                        # one or the other.
+                        "type": "string|list",
+                        "required": True,
+                        "description": (
+                            "List of artifact refs OR JSON-encoded "
+                            "string of the same. Each entry is either "
+                            "an artifact id string OR an object "
+                            "{id, view_hint?}. Comma-separated bare "
+                            "ids are also accepted as a fallback."
+                        ),
+                    },
+                    "layout": {
+                        "type": "string",
+                        "default": "tabs",
+                        "description": (
+                            "Currently only 'tabs' is implemented; "
+                            "'split' is reserved for a follow-up FR "
+                            "and rejected with a clear error today."
+                        ),
+                    },
+                },
+                since="0.3.0",
+            ),
+        ]
+
+    @handler("display")
+    async def handle_display(self, args: dict[str, Any]) -> dict[str, Any]:
+        raw = args.get("artifacts")
+        try:
+            refs = _parse_artifact_refs(raw)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        if not refs:
+            return {"error": "artifacts is required (non-empty list)"}
+
+        layout = str(args.get("layout") or "tabs").strip().lower() or "tabs"
+        if layout != "tabs":
+            return {
+                "error": (
+                    f"layout={layout!r} not supported yet; only 'tabs' is "
+                    "implemented (split-pane is a follow-up FR)"
+                )
+            }
+
+        # Pre-fetch every artifact while we're still on the event
+        # loop — keeps the HTTP server thread free of cross-loop
+        # plumbing. Fetches run concurrently with a small
+        # concurrency cap so a 50-artifact display doesn't pay
+        # 50 * round_trip_time of latency, and the bus doesn't
+        # take a thundering-herd burst either.
+        sem = asyncio.Semaphore(_FETCH_CONCURRENCY)
+
+        async def _fetch_one(ref: ArtifactRef) -> PreparedTab:
+            async with sem:
+                try:
+                    content_type, body, metadata = await self._fetch_via_bus(ref.id)
+                except Exception as exc:  # noqa: BLE001
+                    content_type = "text/plain"
+                    body = (
+                        f"Failed to fetch artifact {ref.id}:\n"
+                        f"{type(exc).__name__}: {exc}"
+                    ).encode("utf-8")
+                    metadata = {"fetch_error": True}
+            return PreparedTab(
+                artifact=ref,
+                content_type=content_type,
+                body=body,
+                metadata=metadata,
+            )
+
+        prepared = list(
+            await asyncio.gather(*[_fetch_one(r) for r in refs])
+        )
+
+        # Server start (and the actual session register) is sync —
+        # offload so a slow first-time bind doesn't stall the loop.
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: viewer_display(prepared, layout=layout),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"viewer display failed: {exc}"}
+        return result
+
+    async def _fetch_via_bus(
+        self, artifact_id: str
+    ) -> Tuple[str, bytes, dict[str, Any]]:
+        """Resolve an artifact for the renderer via the bus.
+
+        Phase 4 will swap this to a local read against the store's
+        own backend once write-ownership migrates. The renderer /
+        server / state modules don't see the read path either way.
+        """
+        result = await self.request(
+            agent_type="bus",
+            operation="artifact_get",
+            args={"id": artifact_id},
+        )
+        payload = (result and result.get("result")) or {}
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"bus.artifact_get returned non-dict: {type(payload).__name__}"
+            )
+        body_text = payload.get("text") or payload.get("body") or ""
+        body = body_text.encode("utf-8") if isinstance(body_text, str) else bytes(body_text)
+        meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        content_type = (
+            meta.get("content_type")
+            or payload.get("content_type")
+            or "text/plain"
+        )
+        return content_type, body, dict(meta)
+
+
+def _parse_artifact_refs(raw: Any) -> list[ArtifactRef]:
+    """Coerce the bus arg into a list of :class:`ArtifactRef`.
+
+    Accepts:
+    * a JSON list of strings (artifact ids)
+    * a JSON list of objects ``{id, view_hint?}``
+    * a comma-separated string of bare ids (fallback for shells)
+    """
+    if raw in (None, ""):
+        return []
+    items: Any = raw
+    if isinstance(raw, str):
+        try:
+            items = json.loads(raw)
+        except (TypeError, ValueError):
+            # Fall back to comma-split.
+            return [
+                ArtifactRef(id=tok.strip())
+                for tok in raw.split(",")
+                if tok.strip()
+            ]
+    if not isinstance(items, list):
+        raise ValueError(
+            f"artifacts must be a JSON list (or comma-separated string), "
+            f"got {type(items).__name__}"
+        )
+    refs: list[ArtifactRef] = []
+    for entry in items:
+        if isinstance(entry, str):
+            ref_id = entry.strip()
+            if ref_id:
+                refs.append(ArtifactRef(id=ref_id))
+        elif isinstance(entry, dict):
+            ref_id = str(entry.get("id") or "").strip()
+            if not ref_id:
+                raise ValueError(f"artifact entry missing 'id': {entry!r}")
+            hint = str(entry.get("view_hint") or "").strip()
+            refs.append(ArtifactRef(id=ref_id, view_hint=hint))
+        else:
+            raise ValueError(
+                f"artifact entry must be str or dict, got {type(entry).__name__}"
+            )
+    return refs
 
 
 def main() -> None:
