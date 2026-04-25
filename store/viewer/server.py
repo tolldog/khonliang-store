@@ -54,6 +54,13 @@ class ViewerServer:
         self.registry = registry
         handler_cls = _make_handler(self)
         self._server = ThreadingHTTPServer((host, port), handler_cls)
+        # ThreadingHTTPServer spawns a new thread per request and
+        # those handler threads are non-daemon by default; a client
+        # that leaves a connection open could prevent the agent
+        # process from exiting cleanly. Mark them daemon so the
+        # process can shut down even when a browser tab is still
+        # holding a keep-alive socket.
+        self._server.daemon_threads = True
         # Bind address (what the socket actually listens on) is
         # separate from the externally-visible host (what we put in
         # the returned URL). Binding on the FQDN can fail with

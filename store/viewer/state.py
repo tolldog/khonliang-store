@@ -73,7 +73,12 @@ class SessionRegistry:
 
     def create_session(self, *, layout: str = "tabs") -> Session:
         with self._lock:
-            session_id = secrets.token_urlsafe(8)
+            # 16 bytes = 128 bits of entropy. The session_id is the
+            # only guard on viewer URLs (no auth on the HTTP surface
+            # — see CLAUDE.md's local-trusted-env posture); 64 bits
+            # was tight for a capability URL when the host port is
+            # network-reachable. 128 bits is the modern floor.
+            session_id = secrets.token_urlsafe(16)
             session = Session(
                 session_id=session_id,
                 layout=layout,
@@ -101,7 +106,10 @@ class SessionRegistry:
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"unknown session: {session_id!r}")
-            tab_id = secrets.token_urlsafe(6)
+            # 12 bytes = ~96 bits — tab_ids are scoped per session
+            # so the threat model is laxer than session_id, but
+            # bump to match the broader entropy posture.
+            tab_id = secrets.token_urlsafe(12)
             tab = Tab(
                 tab_id=tab_id,
                 artifact=artifact,

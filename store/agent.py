@@ -42,6 +42,14 @@ from khonliang_bus import BaseAgent, Skill, handler
 from store.viewer import ArtifactRef, PreparedTab, display as viewer_display
 
 
+# Cap on parallel artifact fetches per display() call. Tuned for
+# "interactive viewer call against a single bus" rather than batch
+# ingest — pick something low enough that a 50-tab display doesn't
+# burst into 50 simultaneous bus requests, but high enough that
+# latency-bound (rather than CPU-bound) fetches don't serialize.
+_FETCH_CONCURRENCY = 8
+
+
 class StoreAgent(BaseAgent):
     """Bus-native store agent.
 
@@ -118,27 +126,33 @@ class StoreAgent(BaseAgent):
 
         # Pre-fetch every artifact while we're still on the event
         # loop — keeps the HTTP server thread free of cross-loop
-        # plumbing. A fetch failure for one ref becomes an inline
-        # error tab so the rest of the session still renders.
-        prepared: list[PreparedTab] = []
-        for ref in refs:
-            try:
-                content_type, body, metadata = await self._fetch_via_bus(ref.id)
-            except Exception as exc:  # noqa: BLE001
-                content_type = "text/plain"
-                body = (
-                    f"Failed to fetch artifact {ref.id}:\n"
-                    f"{type(exc).__name__}: {exc}"
-                ).encode("utf-8")
-                metadata = {"fetch_error": True}
-            prepared.append(
-                PreparedTab(
-                    artifact=ref,
-                    content_type=content_type,
-                    body=body,
-                    metadata=metadata,
-                )
+        # plumbing. Fetches run concurrently with a small
+        # concurrency cap so a 50-artifact display doesn't pay
+        # 50 * round_trip_time of latency, and the bus doesn't
+        # take a thundering-herd burst either.
+        sem = asyncio.Semaphore(_FETCH_CONCURRENCY)
+
+        async def _fetch_one(ref: ArtifactRef) -> PreparedTab:
+            async with sem:
+                try:
+                    content_type, body, metadata = await self._fetch_via_bus(ref.id)
+                except Exception as exc:  # noqa: BLE001
+                    content_type = "text/plain"
+                    body = (
+                        f"Failed to fetch artifact {ref.id}:\n"
+                        f"{type(exc).__name__}: {exc}"
+                    ).encode("utf-8")
+                    metadata = {"fetch_error": True}
+            return PreparedTab(
+                artifact=ref,
+                content_type=content_type,
+                body=body,
+                metadata=metadata,
             )
+
+        prepared = list(
+            await asyncio.gather(*[_fetch_one(r) for r in refs])
+        )
 
         # Server start (and the actual session register) is sync —
         # offload so a slow first-time bind doesn't stall the loop.
