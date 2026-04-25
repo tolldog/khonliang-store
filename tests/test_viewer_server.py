@@ -90,10 +90,12 @@ def test_delete_tab_drops_only_that_tab():
     req = Request(drop_url, method="DELETE")
     with urlopen(req, timeout=2) as resp:
         assert resp.status == 204
-    session = server.registry.get_session(result["session_id"])
-    assert session is not None
-    assert result["tab_ids"][0] not in session.tabs
-    assert result["tab_ids"][1] in session.tabs
+    snap = server.registry.session_snapshot(result["session_id"])
+    assert snap is not None
+    _, tabs = snap
+    tab_ids = {t.tab_id for t in tabs}
+    assert result["tab_ids"][0] not in tab_ids
+    assert result["tab_ids"][1] in tab_ids
 
 
 def test_delete_session_drops_session():
@@ -115,4 +117,4 @@ def test_delete_session_drops_session():
     )
     with urlopen(req, timeout=2) as resp:
         assert resp.status == 204
-    assert server.registry.get_session(result["session_id"]) is None
+    assert server.registry.session_snapshot(result["session_id"]) is None

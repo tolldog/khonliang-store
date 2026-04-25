@@ -170,8 +170,9 @@ async def test_display_handler_records_inline_error_on_fetch_failure(harness):
     # And the rendered tab body should describe the failure.
     server = viewer_server._SERVER
     assert server is not None
-    session = server.registry.get_session(result["session_id"])
-    assert session is not None
-    only_tab = next(iter(session.tabs.values()))
+    snap = server.registry.session_snapshot(result["session_id"])
+    assert snap is not None
+    _, tabs = snap
+    only_tab = tabs[0]
     assert b"Failed to fetch artifact art_aaa" in only_tab.body
     assert only_tab.metadata.get("fetch_error") is True

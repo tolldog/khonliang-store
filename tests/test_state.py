@@ -29,9 +29,10 @@ def test_add_tab_attaches_to_session_and_returns_unique_id():
         body=b"# hi",
     )
     assert t1.tab_id != t2.tab_id
-    fetched = reg.get_session(s.session_id)
-    assert fetched is not None
-    assert set(fetched.tabs) == {t1.tab_id, t2.tab_id}
+    snap = reg.session_snapshot(s.session_id)
+    assert snap is not None
+    _, tabs = snap
+    assert {t.tab_id for t in tabs} == {t1.tab_id, t2.tab_id}
 
 
 def test_add_tab_rejects_unknown_session():
@@ -50,9 +51,10 @@ def test_drop_tab_removes_only_that_tab():
     t1 = reg.add_tab(s.session_id, ArtifactRef(id="a"), content_type="text/plain", body=b"")
     t2 = reg.add_tab(s.session_id, ArtifactRef(id="b"), content_type="text/plain", body=b"")
     assert reg.drop_tab(s.session_id, t1.tab_id) is True
-    fetched = reg.get_session(s.session_id)
-    assert fetched is not None
-    assert set(fetched.tabs) == {t2.tab_id}
+    snap = reg.session_snapshot(s.session_id)
+    assert snap is not None
+    _, tabs = snap
+    assert {t.tab_id for t in tabs} == {t2.tab_id}
 
 
 def test_drop_tab_returns_false_when_unknown():
@@ -67,7 +69,7 @@ def test_drop_session_removes_session_entirely():
     s = reg.create_session()
     reg.add_tab(s.session_id, ArtifactRef(id="a"), content_type="text/plain", body=b"")
     assert reg.drop_session(s.session_id) is True
-    assert reg.get_session(s.session_id) is None
+    assert reg.session_snapshot(s.session_id) is None
 
 
 def test_snapshot_reports_counts():
