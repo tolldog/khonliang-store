@@ -156,13 +156,20 @@ _JS = (
         });
     });
   });
-  // Render markdown blocks via marked. Pass the source through with
-  // the `mangle:false, headerIds:false` options to keep output
-  // deterministic, and explicitly disable raw-HTML passthrough so a
-  // crafted markdown artifact can't smuggle <script> tags.
+  // Render markdown blocks via marked. Apply the documented options
+  // (mangle / headerIds off — keeps output deterministic + avoids
+  // marked's built-in id-mangling); raw-HTML passthrough is curbed
+  // by the post-strip below since marked@12 doesn't expose a
+  // sanitize knob anymore.
   if (typeof marked !== 'undefined') {
     if (typeof marked.use === 'function') {
-      marked.use({ async: false, breaks: true, gfm: true });
+      marked.use({
+        async: false,
+        breaks: true,
+        gfm: true,
+        mangle: false,
+        headerIds: false,
+      });
     }
     document.querySelectorAll('[data-markdown]').forEach(function (host) {
       var src = host.querySelector('[data-source]');

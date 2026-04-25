@@ -34,7 +34,6 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 import sys
 from typing import Any, Tuple
 
@@ -87,7 +86,11 @@ class StoreAgent(BaseAgent):
                     "layout": {
                         "type": "string",
                         "default": "tabs",
-                        "description": "'tabs' (default) or 'split'",
+                        "description": (
+                            "Currently only 'tabs' is implemented; "
+                            "'split' is reserved for a follow-up FR "
+                            "and rejected with a clear error today."
+                        ),
                     },
                 },
                 since="0.3.0",
@@ -105,8 +108,13 @@ class StoreAgent(BaseAgent):
             return {"error": "artifacts is required (non-empty list)"}
 
         layout = str(args.get("layout") or "tabs").strip().lower() or "tabs"
-        if layout not in {"tabs", "split"}:
-            return {"error": f"layout must be 'tabs' or 'split', got {layout!r}"}
+        if layout != "tabs":
+            return {
+                "error": (
+                    f"layout={layout!r} not supported yet; only 'tabs' is "
+                    "implemented (split-pane is a follow-up FR)"
+                )
+            }
 
         # Pre-fetch every artifact while we're still on the event
         # loop — keeps the HTTP server thread free of cross-loop
@@ -161,7 +169,7 @@ class StoreAgent(BaseAgent):
         payload = (result and result.get("result")) or {}
         if not isinstance(payload, dict):
             raise RuntimeError(
-                f"bus_artifact_get returned non-dict: {type(payload).__name__}"
+                f"bus.artifact_get returned non-dict: {type(payload).__name__}"
             )
         body_text = payload.get("text") or payload.get("body") or ""
         body = body_text.encode("utf-8") if isinstance(body_text, str) else bytes(body_text)

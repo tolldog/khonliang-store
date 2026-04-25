@@ -42,8 +42,12 @@ def test_get_session_renders_tab():
         ],
     )
     with urlopen(result["url"], timeout=2) as resp:
+        # Capture status + body inside the with-block; using a
+        # closed urllib response object afterward is implementation-
+        # defined across Python versions.
+        status = resp.status
         body = resp.read().decode("utf-8")
-    assert resp.status == 200
+    assert status == 200
     assert 'data-markdown' in body
     assert "# Hello" in body
     # Tab label uses the view_hint.

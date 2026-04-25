@@ -51,14 +51,18 @@ def display(
     Returns ``{url, session_id, tab_ids}``. ``url`` opens the new
     session; ``tab_ids`` lets callers issue per-tab DELETE requests.
 
-    ``layout='tabs'`` (default) shows one tab at a time;
-    ``layout='split'`` is a hint the client uses to start in a
-    split-pane state (the server stays dumb about layout).
+    Only ``layout='tabs'`` is implemented today. The renderer pipeline
+    can already feed a side-by-side layout, but the client-side CSS
+    toggle hasn't shipped yet — `'split'` is a follow-up FR. Reject
+    unknown values rather than silently accepting them.
     """
     if not prepared:
         raise ValueError("display() requires at least one PreparedTab")
-    if layout not in {"tabs", "split"}:
-        raise ValueError(f"unknown layout {layout!r}; expected 'tabs' or 'split'")
+    if layout != "tabs":
+        raise ValueError(
+            f"layout={layout!r} not supported yet; only 'tabs' is "
+            "implemented (split-pane is a follow-up FR)"
+        )
 
     server = ensure_server(host=host, port=port)
     session: Session = server.registry.create_session(layout=layout)

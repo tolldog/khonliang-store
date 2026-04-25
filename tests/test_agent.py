@@ -132,12 +132,19 @@ async def test_display_handler_returns_url_session_and_tab_ids(harness):
 
 
 @pytest.mark.asyncio
-async def test_display_handler_rejects_bad_layout(harness):
-    result = await harness.call("display", {
-        "artifacts": '["art_aaa"]',
-        "layout": "carousel",
-    })
-    assert result == {"error": "layout must be 'tabs' or 'split', got 'carousel'"}
+async def test_display_handler_rejects_unimplemented_layout(harness):
+    """Only 'tabs' is implemented today. 'split' is reserved for a
+    follow-up FR and must be rejected with a clear error rather
+    than silently accepted.
+    """
+    for bad in ("split", "carousel"):
+        result = await harness.call("display", {
+            "artifacts": '["art_aaa"]',
+            "layout": bad,
+        })
+        assert "error" in result, f"layout={bad!r} should be rejected"
+        assert bad in result["error"]
+        assert "only 'tabs' is" in result["error"]
 
 
 @pytest.mark.asyncio
