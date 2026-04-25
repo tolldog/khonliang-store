@@ -183,21 +183,57 @@ def _reset_for_tests() -> None:
             _SERVER = None
 
 
+def _is_loopback_name(name: str) -> bool:
+    """True if ``name`` is a loopback alias or only resolves to 127.x.
+
+    The narrow string check (`localhost` / `localhost.localdomain` /
+    a `localhost.*` prefix) is not enough — a host where
+    ``socket.getfqdn()`` happens to return any name that resolves
+    only to 127.0.0.0/8 still produces an unreachable URL.
+    """
+    n = (name or "").strip().lower()
+    if not n:
+        return True
+    if n in ("localhost", "localhost.localdomain"):
+        return True
+    if n.startswith("localhost."):
+        return True
+    try:
+        infos = socket.getaddrinfo(n, None, family=socket.AF_INET)
+    except OSError:
+        return False
+    if not infos:
+        return False
+    return all(sockaddr[0].startswith("127.") for *_, sockaddr in infos)
+
+
 def _resolve_external_host() -> str:
     """Pick a hostname the URL we hand back can actually be hit on.
 
-    Prefers the FQDN; falls back to the gethostname output. Doesn't
-    return ``localhost`` — per the FR, the user runs the bus on a
-    headless box and views from a laptop, so binding on loopback
-    would defeat the purpose.
+    Prefers the FQDN; falls back to the gethostname output. Per the
+    FR, the user runs the bus on a headless box and views from a
+    laptop, so a loopback-only hostname (``localhost`` or anything
+    that resolves only to 127.x) defeats the purpose. Final fallback
+    is an egress-interface IPv4 — a UDP-connect to a public address
+    has the kernel pick the outbound interface so we can read its
+    bound address back without sending traffic.
     """
+    for resolver in (socket.getfqdn, socket.gethostname):
+        try:
+            name = resolver()
+        except OSError:
+            continue
+        if name and not _is_loopback_name(name):
+            return name
     try:
-        fqdn = socket.getfqdn()
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("8.8.8.8", 80))
+            ip = probe.getsockname()[0]
     except OSError:
-        fqdn = ""
-    if fqdn and fqdn != "localhost.localdomain":
-        return fqdn
-    return socket.gethostname() or "0.0.0.0"
+        ip = ""
+    if ip and not ip.startswith("127."):
+        return ip
+    return "0.0.0.0"
 
 
 # Request handler factory

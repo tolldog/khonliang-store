@@ -101,8 +101,10 @@ def test_graphviz_renderer_emits_svg_when_dot_available():
         b"digraph G { a -> b }",
         {},
     )
-    assert "<svg" in out
+    # SVG is embedded as a base64 data: URL on an <img> so the
+    # browser treats it as an image (no script execution).
     assert 'class="graphviz"' in out
+    assert "data:image/svg+xml;base64," in out
 
 
 def test_graphviz_renderer_falls_back_when_dot_missing(monkeypatch):

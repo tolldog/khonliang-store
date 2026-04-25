@@ -23,6 +23,7 @@ the rest of the viewer plumbing.
 
 from __future__ import annotations
 
+import base64
 import html
 import json
 import logging
@@ -168,8 +169,13 @@ def _render_graphviz(body: bytes, metadata: dict[str, Any]) -> str:
     """Render a graphviz source via ``dot -Tsvg``. Falls back to the
     raw source in a <pre> if ``dot`` isn't on PATH.
 
-    SVG output is inlined directly so the browser doesn't need a
-    second round-trip; caller pays the cost once at render time.
+    SVG output is embedded as a base64 ``data:`` URL on an
+    ``<img>`` tag. Browsers do not execute scripts inside an SVG
+    that's loaded via ``<img src>`` (only inline ``<svg>`` or
+    ``<iframe>``-loaded SVGs run scripts), so a malicious DOT
+    source can't escalate into the viewer's origin via the
+    rendered SVG. The single round-trip property is preserved —
+    the SVG bytes ride inline in the page response.
     """
     if shutil.which("dot") is None:
         return (
@@ -192,14 +198,12 @@ def _render_graphviz(body: bytes, metadata: dict[str, Any]) -> str:
             f"{_render_raw(body, metadata)}"
             "</div>"
         )
-    # Strip the XML prolog so the SVG inlines cleanly inside the
-    # tab pane.
-    svg = proc.stdout.decode("utf-8", errors="replace")
-    if svg.startswith("<?xml"):
-        end = svg.find("?>")
-        if end != -1:
-            svg = svg[end + 2 :].lstrip()
-    return f"<div class=\"graphviz\">{svg}</div>"
+    encoded = base64.b64encode(proc.stdout).decode("ascii")
+    return (
+        "<div class=\"graphviz\">"
+        f"<img src=\"data:image/svg+xml;base64,{encoded}\" alt=\"graphviz diagram\" />"
+        "</div>"
+    )
 
 
 # Source-code renderers — register a handful so common file types
