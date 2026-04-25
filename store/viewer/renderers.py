@@ -29,6 +29,7 @@ import json
 import logging
 import shutil
 import subprocess
+import threading
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,12 @@ logger = logging.getLogger(__name__)
 RendererFn = Callable[[bytes, dict[str, Any]], str]
 
 _REGISTRY: dict[str, RendererFn] = {}
+# Guard registry mutations so a renderer registered after the HTTP
+# server is up — uncommon but legal per the FR's extension-hook
+# contract — can't race a concurrent ``render()`` on a worker
+# thread. Reads under the lock keep the safety contract explicit
+# rather than implicit-on-CPython-GIL.
+_REGISTRY_LOCK = threading.RLock()
 
 
 def _registry_snapshot() -> dict[str, RendererFn]:
@@ -45,13 +52,15 @@ def _registry_snapshot() -> dict[str, RendererFn]:
     Pair with :func:`_registry_restore` in a fixture so a test that
     registers a custom MIME type doesn't pollute later tests.
     """
-    return dict(_REGISTRY)
+    with _REGISTRY_LOCK:
+        return dict(_REGISTRY)
 
 
 def _registry_restore(snapshot: dict[str, RendererFn]) -> None:
     """Test-only hook: replace the registry contents with ``snapshot``."""
-    _REGISTRY.clear()
-    _REGISTRY.update(snapshot)
+    with _REGISTRY_LOCK:
+        _REGISTRY.clear()
+        _REGISTRY.update(snapshot)
 
 
 def register_renderer(content_type: str) -> Callable[[RendererFn], RendererFn]:
@@ -66,7 +75,8 @@ def register_renderer(content_type: str) -> Callable[[RendererFn], RendererFn]:
     ct = content_type.strip().lower()
 
     def deco(fn: RendererFn) -> RendererFn:
-        _REGISTRY[ct] = fn
+        with _REGISTRY_LOCK:
+            _REGISTRY[ct] = fn
         return fn
 
     return deco
@@ -80,7 +90,8 @@ def render(content_type: str, body: bytes, metadata: dict[str, Any]) -> str:
     error block — a single bad artifact must not 500 the viewer.
     """
     base = (content_type or "").split(";", 1)[0].strip().lower()
-    fn = _REGISTRY.get(base) or _REGISTRY.get("text/plain") or _render_raw
+    with _REGISTRY_LOCK:
+        fn = _REGISTRY.get(base) or _REGISTRY.get("text/plain") or _render_raw
     try:
         return fn(body, metadata)
     except Exception as exc:  # noqa: BLE001

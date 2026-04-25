@@ -183,13 +183,18 @@ def _reset_for_tests() -> None:
             _SERVER = None
 
 
-def _is_loopback_name(name: str) -> bool:
-    """True if ``name`` is a loopback alias or only resolves to 127.x.
+def _is_unusable_external_host(name: str) -> bool:
+    """True if the URL we'd build with ``name`` won't be reachable.
 
-    The narrow string check (`localhost` / `localhost.localdomain` /
-    a `localhost.*` prefix) is not enough — a host where
-    ``socket.getfqdn()`` happens to return any name that resolves
-    only to 127.0.0.0/8 still produces an unreachable URL.
+    Lumps three "won't work" cases together so the caller can
+    treat them uniformly and move to the next candidate / fallback:
+
+    * empty / loopback alias (``localhost`` / ``localhost.*`` /
+      ``localhost.localdomain``)
+    * resolves only to 127.0.0.0/8 — a name that happens to map to
+      loopback still yields an unreachable URL
+    * doesn't resolve at all — embedding it in a URL is just as
+      broken as a loopback-only name
     """
     n = (name or "").strip().lower()
     if not n:
@@ -201,29 +206,34 @@ def _is_loopback_name(name: str) -> bool:
     try:
         infos = socket.getaddrinfo(n, None, family=socket.AF_INET)
     except OSError:
-        return False
+        # Unresolvable name — embedding it in a URL produces a
+        # broken URL, so treat it as unusable just like a loopback.
+        return True
     if not infos:
-        return False
+        return True
     return all(sockaddr[0].startswith("127.") for *_, sockaddr in infos)
 
 
 def _resolve_external_host() -> str:
     """Pick a hostname the URL we hand back can actually be hit on.
 
-    Prefers the FQDN; falls back to the gethostname output. Per the
-    FR, the user runs the bus on a headless box and views from a
-    laptop, so a loopback-only hostname (``localhost`` or anything
-    that resolves only to 127.x) defeats the purpose. Final fallback
-    is an egress-interface IPv4 — a UDP-connect to a public address
-    has the kernel pick the outbound interface so we can read its
-    bound address back without sending traffic.
+    Prefers the FQDN; falls back to ``gethostname()``. Per the FR,
+    the user runs the bus on a headless box and views from a
+    laptop, so a loopback-only or unresolvable hostname defeats
+    the purpose. If both names are unusable, probe for a non-
+    loopback egress IPv4 (UDP-connect to a public address has the
+    kernel pick the outbound interface so we can read its bound
+    address back without sending traffic). Final fallback is
+    ``127.0.0.1`` plus a warning — useful when the agent and the
+    browser are on the same host, and the warning surfaces the
+    "remote-laptop view won't work" failure mode.
     """
     for resolver in (socket.getfqdn, socket.gethostname):
         try:
             name = resolver()
         except OSError:
             continue
-        if name and not _is_loopback_name(name):
+        if name and not _is_unusable_external_host(name):
             return name
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
@@ -233,7 +243,11 @@ def _resolve_external_host() -> str:
         ip = ""
     if ip and not ip.startswith("127."):
         return ip
-    return "0.0.0.0"
+    logger.warning(
+        "viewer host resolution: no non-loopback name or egress IPv4 found; "
+        "falling back to 127.0.0.1 — the URL won't be reachable from another machine"
+    )
+    return "127.0.0.1"
 
 
 # Request handler factory
