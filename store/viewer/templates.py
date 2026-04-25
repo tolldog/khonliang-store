@@ -16,10 +16,17 @@ from typing import Iterable, Mapping
 # Pinned CDN URLs + SRI hashes — bumping deliberately is preferable
 # to silent upgrades that change rendering behavior under us, and
 # the integrity attribute means a compromised CDN can't substitute
-# different bytes without the browser refusing to load them.
+# different bytes without the browser refusing to load the script.
 # Hashes are sha384, the standard SRI form jsdelivr publishes.
 # When bumping versions, regenerate via:
 #   curl -s <url> | openssl dgst -sha384 -binary | base64
+# Caveat: the prism autoloader fetches `components/prism-<lang>.js`
+# at runtime to support languages it didn't ship inline (python,
+# go, etc.). Those follow-up loads do not carry SRI attributes —
+# the autoloader plugin doesn't generate them. The CSP narrows
+# script-src to jsdelivr so a compromised origin would still be
+# the only attacker; the SRI guarantee covers the four assets
+# pinned below, not the per-language components fetched after.
 _MARKED_CDN = "https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"
 _MARKED_SRI = "sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi"
 _PRISM_CDN_CSS = "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css"
@@ -102,7 +109,11 @@ body {
 .pane pre { background: var(--bg-alt); padding: 12px; overflow: auto; border-radius: 4px; }
 .pane.split-active { display: flex; gap: 12px; }
 .pane.split-active > * { flex: 1; min-width: 0; overflow: auto; }
-.markdown pre[data-source] { display: none; }
+/* Source pre is visible by default so the user still sees content
+   when marked.js fails to load (CDN blocked / offline). The JS
+   below adds a `rendered` class once marked.parse() succeeds, at
+   which point we hide the raw source pane. */
+.markdown.rendered pre[data-source] { display: none; }
 .render-error { color: var(--error); padding: 12px; border: 1px solid var(--error); border-radius: 4px; }
 #empty { padding: 24px; color: var(--muted); }
 """
@@ -194,6 +205,10 @@ _JS = (
         );
         out.innerHTML = html;
         host.appendChild(out);
+        // Marked succeeded — flip the host into "rendered" mode so
+        // the raw source pre is hidden. If marked failed to load
+        // we never get here and the raw pre stays visible.
+        host.classList.add('rendered');
       }
     });
   }

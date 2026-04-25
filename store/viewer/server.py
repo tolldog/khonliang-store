@@ -337,6 +337,13 @@ def _make_handler(server: ViewerServer) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Content-Security-Policy", _CSP_HEADER)
             self.send_header("X-Content-Type-Options", "nosniff")
+            # session_id is the only guard on the URL — Referer
+            # would leak it on every external link click.
+            self.send_header("Referrer-Policy", "no-referrer")
+            # Sessions are documented as ephemeral; ensure the
+            # browser doesn't keep a copy after the user closes
+            # the tab.
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             if body:
                 self.wfile.write(body)
