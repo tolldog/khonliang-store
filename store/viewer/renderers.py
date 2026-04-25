@@ -1,10 +1,11 @@
 """Extensible renderer registry for the viewer.
 
 Every artifact rendered in a tab passes through ``render(content_type,
-body, metadata)``. Lookup is exact-content-type-first with a
-parameter-stripping fallback (``application/json; charset=utf-8`` →
-``application/json``); if no registered renderer matches, the raw
-``<pre>`` fallback is used.
+body, metadata)``. The content_type's parameters are stripped before
+lookup (``application/json; charset=utf-8`` → ``application/json``)
+so registrations don't have to enumerate charset variants. If no
+registered renderer matches the base type, the raw ``<pre>`` fallback
+is used.
 
 Adding a new file type is the explicit extension hook — register a
 renderer and the viewer will pick it up::
@@ -252,9 +253,11 @@ def _make_code_renderer(language: str) -> RendererFn:
 
 
 for _ct, _lang in _CODE_LANGS.items():
-    _REGISTRY[_ct] = _make_code_renderer(_lang)
+    register_renderer(_ct)(_make_code_renderer(_lang))
 
 
 def registered_content_types() -> list[str]:
     """Snapshot of the renderer keys (test + introspection helper)."""
-    return sorted(_REGISTRY.keys())
+    with _REGISTRY_LOCK:
+        keys = list(_REGISTRY.keys())
+    return sorted(keys)

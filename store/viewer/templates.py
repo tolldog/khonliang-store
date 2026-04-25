@@ -185,6 +185,13 @@ _JS = (
         var html = marked.parse(raw);
         html = html.replace(/<script[\\s\\S]*?<\\/script>/gi, '');
         html = html.replace(/ on[a-z]+\\s*=\\s*("[^"]*"|'[^']*'|[^\\s>]+)/gi, '');
+        // Neutralize `javascript:` URI schemes in href/src
+        // attributes — even with the CSP, an inline `<a href=
+        // "javascript:...">` would still execute on click.
+        html = html.replace(
+          /(href|src)\\s*=\\s*("\\s*javascript\\s*:[^"]*"|'\\s*javascript\\s*:[^']*'|\\s*javascript\\s*:[^\\s>]*)/gi,
+          '$1="#"'
+        );
         out.innerHTML = html;
         host.appendChild(out);
       }
