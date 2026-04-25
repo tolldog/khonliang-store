@@ -67,13 +67,21 @@ class StoreAgent(BaseAgent):
                 "text — extensible by registering new renderers.",
                 {
                     "artifacts": {
-                        "type": "string",
+                        # The handler accepts either a JSON-encoded
+                        # string or a structured list (objects of
+                        # {id, view_hint?} or bare id strings).
+                        # Advertised as 'string|list' so bus clients
+                        # that pass structured args don't trip a
+                        # client-side validator that only expected
+                        # one or the other.
+                        "type": "string|list",
                         "required": True,
                         "description": (
-                            "JSON list of refs. Each entry is either "
+                            "List of artifact refs OR JSON-encoded "
+                            "string of the same. Each entry is either "
                             "an artifact id string OR an object "
                             "{id, view_hint?}. Comma-separated bare "
-                            "ids are also accepted."
+                            "ids are also accepted as a fallback."
                         ),
                     },
                     "layout": {
@@ -82,7 +90,7 @@ class StoreAgent(BaseAgent):
                         "description": "'tabs' (default) or 'split'",
                     },
                 },
-                since="0.2.0",
+                since="0.3.0",
             ),
         ]
 

@@ -4,39 +4,35 @@ Bus-native store agent. Target eventual owner of the artifact backend
 (currently served by the bus's `bus_artifact_*` MCP surface) and host
 of a browser-based viewer mode for rendered artifacts.
 
-## Status — Phase 1 (scaffold)
+## Status — Phase 3 viewer landed; artifact-ownership migration follows
 
-Registered-but-empty shell. The agent connects to the bus and
-declares no subclass skills yet. The inherited `health_check`
-handler from `BaseAgent` remains dispatchable for liveness probes,
-but is not listed in `registration.skills` — the test harness builds
-registration from the subclass's `register_skills()` return, which
-skips `BaseAgent.BUILT_IN_SKILLS`. Real functionality lands in
-follow-up FRs one skill at a time so the infrastructure work
-(repo, pyproject, tests, CLI) doesn't get re-litigated every
-round.
+Registered bus agent with one real skill: `display(artifacts,
+layout='tabs')`. Lazily starts an in-process HTTP viewer on first
+call, pre-fetches the listed artifacts via the bus, and returns a
+URL the caller can open in a browser. The viewer renders by
+content_type — markdown via marked.js (CDN), JSON pretty-printed
+with click-to-collapse, graphviz via local `dot -Tsvg`, common code
+MIME types via prism.js (CDN), and a `<pre>` fallback for unknown
+types. The renderer registry is the explicit extension hook: new
+file types extend via `@register_renderer("type/x")`.
 
-Tracked under `fr_store_4ea7d48b`. Sibling FR `fr_store_d22556bb`
-covers the viewer mode once artifact read skills are in place.
+Tracked under `fr_store_d22556bb`. The Phase-1 scaffold under
+`fr_store_4ea7d48b` is also complete.
 
-## Eventual scope
+## Phase status
 
-- **Artifact read skills**: `get`, `list`, `metadata`, `head`, `tail`,
-  `grep`, `excerpt`. Same shape as `bus_artifact_*` today, but owned
-  by the store agent.
-- **Artifact write skills**: `stage_payload`, `replace`, `delete`,
-  with provenance + content-type tracking.
-- **Viewer mode**: `display(artifacts)` returns an ephemeral URL that
-  renders each artifact (graphviz → SVG, markdown → HTML, JSON →
-  collapsible tree, code → syntax-highlighted) in a tabbed or
-  side-by-side browser view.
-- **Migration path**: once the store agent owns the backend, the bus
-  artifact surface becomes either a proxy or is deprecated in favor
-  of direct `store-*` skills.
-
-Everything above is deliberately **out of scope for Phase 1**. No
-artifact ownership, no viewer, no migration — just a bus-registered
-participant with nothing to do yet.
+- **Phase 1 — scaffold** ✅ shipped (PR #1).
+- **Phase 2 — artifact read skills** (`get`, `list`, `metadata`,
+  `head`, `tail`, `grep`, `excerpt`) — _open_. The viewer reads
+  artifacts via the bus today; this phase moves ownership of reads
+  into the store.
+- **Phase 3 — viewer mode** ✅ shipped (PR #2).
+- **Phase 4 — artifact write skills + migration**
+  (`stage_payload`, `replace`, `delete`) — _open_. Once writes move,
+  the bus artifact surface becomes a read-proxy or is removed.
+- **Phase 5 — researcher integration** — _open_. Wires
+  `fr_researcher_000ad07c`'s `stage_payload` / `ingest_from_artifact`
+  through the store once writes land.
 
 ## Architecture boundary
 

@@ -49,18 +49,26 @@ class ViewerServer:
         host: str,
         port: int,
         registry: SessionRegistry,
+        public_host: Optional[str] = None,
     ) -> None:
         self.registry = registry
         handler_cls = _make_handler(self)
         self._server = ThreadingHTTPServer((host, port), handler_cls)
+        # Bind address (what the socket actually listens on) is
+        # separate from the externally-visible host (what we put in
+        # the returned URL). Binding on the FQDN can fail with
+        # EADDRNOTAVAIL on hosts where the DNS name doesn't resolve
+        # to a locally-configured interface; bind 0.0.0.0 by default
+        # and only use the public_host for URL composition.
         self.host = host
+        self.public_host = public_host or host
         # Read the bound port back in case 0 was passed.
         self.port = self._server.server_address[1]
         self._thread: Optional[threading.Thread] = None
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        return f"http://{self.public_host}:{self.port}"
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -106,16 +114,31 @@ def ensure_server(
     Subsequent calls return the cached instance — the registry
     passed on the first call wins, on the assumption that a single
     agent process owns the viewer for its lifetime.
+
+    ``host`` is the bind address. The default (``None``) binds
+    ``0.0.0.0`` so any interface can serve the viewer; the URL the
+    caller gets back uses the externally-resolvable hostname (FQDN
+    when available) so a browser on a different machine can reach
+    it. Tests pass ``host="127.0.0.1"`` to scope the listener to
+    loopback.
     """
     global _SERVER
     with _LOCK:
         if _SERVER is not None:
             return _SERVER
-        bind_host = host or _resolve_external_host()
+        if host is None:
+            bind_host = "0.0.0.0"
+            public_host = _resolve_external_host()
+        else:
+            bind_host = host
+            # Caller-supplied host (typically a test using
+            # 127.0.0.1) is also the public host.
+            public_host = host
         srv = ViewerServer(
             host=bind_host,
             port=port,
             registry=registry or SessionRegistry(),
+            public_host=public_host,
         )
         srv.start()
         _SERVER = srv
@@ -209,11 +232,13 @@ def _make_handler(server: ViewerServer) -> type[BaseHTTPRequestHandler]:
         # -- helpers ---------------------------------------------------------
 
         def _serve_session(self, session_id: str) -> None:
-            session = registry.get_session(session_id)
-            if session is None:
+            # Snapshot under the registry lock so a concurrent
+            # DELETE doesn't mutate the tab list mid-render.
+            snap = registry.session_snapshot(session_id)
+            if snap is None:
                 self._send(404, "text/plain; charset=utf-8", b"unknown session")
                 return
-            tabs = list(session.tabs.values())
+            session, tabs = snap
             rendered: dict[str, str] = {}
             for tab in tabs:
                 rendered[tab.tab_id] = render(

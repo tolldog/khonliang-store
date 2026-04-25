@@ -114,8 +114,32 @@ class SessionRegistry:
             return tab
 
     def get_session(self, session_id: str) -> Optional[Session]:
+        """Return the live Session — caller MUST NOT iterate its
+        ``tabs`` outside the registry lock.
+
+        Prefer :meth:`session_snapshot` when you only need a
+        consistent view; that returns a frozen tuple of tabs taken
+        under the lock.
+        """
         with self._lock:
             return self._sessions.get(session_id)
+
+    def session_snapshot(
+        self, session_id: str
+    ) -> Optional[tuple["Session", tuple["Tab", ...]]]:
+        """Return ``(session, tab_tuple)`` taken atomically.
+
+        The HTTP server runs on a worker thread; per-tab DELETE
+        requests can drop entries from another thread mid-render.
+        Snapshotting under the lock avoids "dict changed size
+        during iteration" and guarantees the renderer sees a
+        single consistent set of tabs.
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
+            return session, tuple(session.tabs.values())
 
     def get_tab(self, session_id: str, tab_id: str) -> Optional[Tab]:
         with self._lock:

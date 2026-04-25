@@ -107,10 +107,14 @@ def _render_raw(body: bytes, metadata: dict[str, Any]) -> str:
 
 @register_renderer("application/json")
 def _render_json(body: bytes, metadata: dict[str, Any]) -> str:
-    """Pretty-print JSON. The actual collapsible-tree behavior is a
-    client-side enhancement (see templates.py); the server emits
-    indent-2 JSON inside a ``<pre data-tree>`` element so the JS
-    layer can decorate it without re-fetching.
+    """Pretty-print JSON inside ``<pre data-tree>``.
+
+    The client-side script in :mod:`store.viewer.templates` decorates
+    ``data-tree`` elements with a click-to-collapse affordance so
+    deep payloads don't dominate the viewport. Richer tree rendering
+    (key-by-key expand, search) is a follow-up if the simple
+    affordance proves insufficient — the server's job is just the
+    indent-2 stringify.
     """
     text = _decode(body)
     try:

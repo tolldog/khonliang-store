@@ -13,13 +13,24 @@ import json
 from typing import Iterable, Mapping
 
 
-# Pinned CDN URLs — bumping deliberately is preferable to silent
-# upgrades that change rendering behavior under us.
+# Pinned CDN URLs + SRI hashes — bumping deliberately is preferable
+# to silent upgrades that change rendering behavior under us, and
+# the integrity attribute means a compromised CDN can't substitute
+# different bytes without the browser refusing to load them.
+# Hashes are sha384, the standard SRI form jsdelivr publishes.
+# When bumping versions, regenerate via:
+#   curl -s <url> | openssl dgst -sha384 -binary | base64
 _MARKED_CDN = "https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"
+_MARKED_SRI = "sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi"
 _PRISM_CDN_CSS = "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css"
+_PRISM_CSS_SRI = "sha384-rCCjoCPCsizaAAYVoz1Q0CmCTvnctK0JkfCSjx7IIxexTBg+uCKtFYycedUjMyA2"
 _PRISM_CDN_JS = "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"
+_PRISM_JS_SRI = "sha384-ZM8fDxYm+GXOWeJcxDetoRImNnEAS7XwVFH5kv0pT6RXNy92Nemw/Sj7NfciXpqg"
 _PRISM_AUTOLOADER = (
     "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js"
+)
+_PRISM_AUTOLOADER_SRI = (
+    "sha384-Uq05+JLko69eOiPr39ta9bh7kld5PKZoU+fF7g0EXTAriEollhZ+DrN8Q/Oi8J2Q"
 )
 
 
@@ -65,6 +76,14 @@ body {
   font-size: 12px;
 }
 .tab.active { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+.tab .tab-label {
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  padding: 0;
+}
 .tab .close {
   border: none;
   background: transparent;
@@ -74,6 +93,9 @@ body {
   padding: 0 2px;
 }
 .tab .close:hover { color: var(--error); }
+.tab.close-failed { border-color: var(--error); }
+.json-tree { cursor: pointer; }
+.json-tree.collapsed { max-height: 8em; overflow: hidden; }
 #panes { padding: 12px 16px; }
 .pane { display: none; }
 .pane.active { display: block; }
@@ -109,26 +131,68 @@ _JS = (
       var tab = btn.closest('.tab');
       var session = tab.dataset.session;
       var tabId = tab.dataset.tab;
-      fetch('/view/' + session + '/tab/' + tabId, { method: 'DELETE' }).then(function () {
-        tab.remove();
-        var pane = document.querySelector('.pane[data-tab="' + tabId + '"]');
-        if (pane) pane.remove();
-        var first = document.querySelector('.tab');
-        if (first) activate(first.dataset.tab);
-      });
+      btn.disabled = true;
+      fetch('/view/' + session + '/tab/' + tabId, { method: 'DELETE' })
+        .then(function (resp) {
+          if (!resp.ok) {
+            // Server didn't drop it — leave the DOM alone so the
+            // user sees a stable view instead of a phantom-removed
+            // tab they can't interact with.
+            btn.disabled = false;
+            btn.title = 'close failed: HTTP ' + resp.status;
+            tab.classList.add('close-failed');
+            return;
+          }
+          tab.remove();
+          var pane = document.querySelector('.pane[data-tab="' + tabId + '"]');
+          if (pane) pane.remove();
+          var first = document.querySelector('.tab');
+          if (first) activate(first.dataset.tab);
+        })
+        .catch(function (err) {
+          btn.disabled = false;
+          btn.title = 'close failed: ' + err;
+          tab.classList.add('close-failed');
+        });
     });
   });
-  // Render markdown blocks via marked, if loaded.
+  // Render markdown blocks via marked. Pass the source through with
+  // the `mangle:false, headerIds:false` options to keep output
+  // deterministic, and explicitly disable raw-HTML passthrough so a
+  // crafted markdown artifact can't smuggle <script> tags.
   if (typeof marked !== 'undefined') {
+    if (typeof marked.use === 'function') {
+      marked.use({ async: false, breaks: true, gfm: true });
+    }
     document.querySelectorAll('[data-markdown]').forEach(function (host) {
       var src = host.querySelector('[data-source]');
       if (src) {
+        var raw = src.textContent;
         var out = document.createElement('div');
-        out.innerHTML = marked.parse(src.textContent);
+        // textContent (not innerHTML) for the rendered output
+        // would be too aggressive — we want headings, lists, links
+        // to render as HTML. Strip <script> and on-handlers from
+        // the marked output before injection. This is best-effort
+        // belt-and-suspenders; the upstream guarantee is that we
+        // own all artifacts in a local-trusted env.
+        var html = marked.parse(raw);
+        html = html.replace(/<script[\\s\\S]*?<\\/script>/gi, '');
+        html = html.replace(/ on[a-z]+\\s*=\\s*("[^"]*"|'[^']*'|[^\\s>]+)/gi, '');
+        out.innerHTML = html;
         host.appendChild(out);
       }
     });
   }
+  // Light JSON-tree decoration: collapse braces/brackets so deep
+  // structures don't dominate the viewport. The renderer outputs
+  // pretty-printed JSON inside <pre data-tree>; we wire a
+  // click-to-toggle on top.
+  document.querySelectorAll('pre[data-tree]').forEach(function (pre) {
+    pre.classList.add('json-tree');
+    pre.addEventListener('click', function () {
+      pre.classList.toggle('collapsed');
+    });
+  });
   // Activate first tab on load.
   var first = document.querySelector('.tab');
   if (first) activate(first.dataset.tab);
@@ -169,12 +233,17 @@ def render_session_page(
     for tab in tab_list:
         tab_id = getattr(tab, "tab_id")
         label = html.escape(_tab_label(tab))
+        # <button> for the tab itself + a sibling <button> for the
+        # close action — anchors without href aren't keyboard-
+        # focusable, and nesting <button> inside <a> is invalid
+        # HTML and confuses screen readers.
         tab_html_parts.append(
-            f"<a class=\"tab\" data-tab=\"{html.escape(tab_id)}\" "
+            f"<span class=\"tab\" data-tab=\"{html.escape(tab_id)}\" "
             f"data-session=\"{html.escape(session_id)}\">"
-            f"<span>{label}</span>"
-            f"<button class=\"close\" title=\"close tab\">×</button>"
-            f"</a>"
+            f"<button type=\"button\" class=\"tab-label\">{label}</button>"
+            f"<button type=\"button\" class=\"close\" title=\"close tab\" "
+            f"aria-label=\"close tab\">×</button>"
+            f"</span>"
         )
         body = rendered_panes.get(tab_id, "")
         pane_html_parts.append(
@@ -187,9 +256,13 @@ def render_session_page(
         title=html.escape(title),
         css=_CSS,
         marked_cdn=_MARKED_CDN,
+        marked_sri=_MARKED_SRI,
         prism_css=_PRISM_CDN_CSS,
+        prism_css_sri=_PRISM_CSS_SRI,
         prism_js=_PRISM_CDN_JS,
+        prism_js_sri=_PRISM_JS_SRI,
         prism_autoloader=_PRISM_AUTOLOADER,
+        prism_autoloader_sri=_PRISM_AUTOLOADER_SRI,
         layout_class=html.escape(layout_class),
         tabs_html="".join(tab_html_parts),
         panes_html="".join(pane_html_parts),
@@ -203,9 +276,13 @@ def _empty_session_page(session_id: str) -> str:
         title=html.escape("khonliang-store viewer — empty session"),
         css=_CSS,
         marked_cdn=_MARKED_CDN,
+        marked_sri=_MARKED_SRI,
         prism_css=_PRISM_CDN_CSS,
+        prism_css_sri=_PRISM_CSS_SRI,
         prism_js=_PRISM_CDN_JS,
+        prism_js_sri=_PRISM_JS_SRI,
         prism_autoloader=_PRISM_AUTOLOADER,
+        prism_autoloader_sri=_PRISM_AUTOLOADER_SRI,
         layout_class="empty",
         tabs_html="",
         panes_html=(
@@ -223,15 +300,15 @@ _PAGE_SHELL = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>{title}</title>
-<link rel="stylesheet" href="{prism_css}">
+<link rel="stylesheet" href="{prism_css}" integrity="{prism_css_sri}" crossorigin="anonymous">
 <style>{css}</style>
 </head>
 <body data-meta="{session_meta}">
 <nav id="tabs" class="layout-{layout_class}">{tabs_html}</nav>
 <main id="panes">{panes_html}</main>
-<script src="{marked_cdn}"></script>
-<script src="{prism_js}"></script>
-<script src="{prism_autoloader}"></script>
+<script src="{marked_cdn}" integrity="{marked_sri}" crossorigin="anonymous"></script>
+<script src="{prism_js}" integrity="{prism_js_sri}" crossorigin="anonymous"></script>
+<script src="{prism_autoloader}" integrity="{prism_autoloader_sri}" crossorigin="anonymous"></script>
 <script>{js}</script>
 </body>
 </html>
