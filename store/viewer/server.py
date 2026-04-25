@@ -23,6 +23,7 @@ fetching from inside the HTTP handler.
 from __future__ import annotations
 
 import logging
+import secrets
 import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,19 +37,16 @@ from store.viewer.templates import render_session_page
 logger = logging.getLogger(__name__)
 
 
-# Content-Security-Policy applied to every viewer response.
-# Defense-in-depth on top of the markdown post-strip and the
-# local-trusted-environment posture: even if an artifact slips a
-# `<script>` past the JS sanitizer, the CSP refuses to execute
-# anything not from `self` or jsdelivr (the pinned-and-SRI'd CDN
-# we load marked + prism from). 'unsafe-inline' for scripts/styles
-# is required because the viewer's tab-handling JS and CSS are
-# inlined in the HTML; switching to a nonce-based policy is a
-# follow-up if untrusted-artifact rendering becomes a real use case.
+# Default Content-Security-Policy for non-page responses (healthz,
+# 404s, DELETE replies). No `'unsafe-inline'` — these responses
+# carry no inline scripts or styles. The session page builds a
+# per-response variant with a nonce (see :func:`_csp_with_nonce`)
+# so the CSP backstops any sanitizer bypass that injects an
+# inline `<script>` without our matching nonce.
 _CSP_HEADER = (
     "default-src 'self'; "
-    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "script-src 'self' https://cdn.jsdelivr.net; "
+    "style-src 'self' https://cdn.jsdelivr.net; "
     "img-src 'self' data: blob: https:; "
     "font-src 'self' data: https://cdn.jsdelivr.net; "
     "connect-src 'self'; "
@@ -56,6 +54,28 @@ _CSP_HEADER = (
     "base-uri 'none'; "
     "frame-ancestors 'none'"
 )
+
+
+def _csp_with_nonce(nonce: str) -> str:
+    """Per-response CSP for the session page.
+
+    Adds ``'nonce-<value>'`` to script-src + style-src so the
+    templated inline ``<script>`` / ``<style>`` carrying the
+    matching nonce can execute. Any inline tag *without* the
+    matching nonce — including one a sanitizer bypass might
+    inject — is refused by the browser.
+    """
+    return (
+        "default-src 'self'; "
+        f"script-src 'self' 'nonce-{nonce}' https://cdn.jsdelivr.net; "
+        f"style-src 'self' 'nonce-{nonce}' https://cdn.jsdelivr.net; "
+        "img-src 'self' data: blob: https:; "
+        "font-src 'self' data: https://cdn.jsdelivr.net; "
+        "connect-src 'self'; "
+        "object-src 'none'; "
+        "base-uri 'none'; "
+        "frame-ancestors 'none'"
+    )
 
 
 class ViewerServer:
@@ -323,19 +343,38 @@ def _make_handler(server: ViewerServer) -> type[BaseHTTPRequestHandler]:
                 rendered[tab.tab_id] = render(
                     tab.content_type, tab.body, tab.metadata
                 )
+            # Per-response CSP nonce — emitted on the inline
+            # <script>/<style> tags inside the page; the response
+            # CSP header allows only inline tags carrying this
+            # exact nonce, so a sanitizer-bypass injection of a
+            # bare <script> can't execute.
+            nonce = secrets.token_urlsafe(16)
             html_body = render_session_page(
                 session.session_id,
                 layout=session.layout,
                 tabs=tabs,
                 rendered_panes=rendered,
+                nonce=nonce,
             )
-            self._send(200, "text/html; charset=utf-8", html_body.encode("utf-8"))
+            self._send(
+                200,
+                "text/html; charset=utf-8",
+                html_body.encode("utf-8"),
+                csp=_csp_with_nonce(nonce),
+            )
 
-        def _send(self, status: int, content_type: str, body: bytes) -> None:
+        def _send(
+            self,
+            status: int,
+            content_type: str,
+            body: bytes,
+            *,
+            csp: Optional[str] = None,
+        ) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Content-Security-Policy", _CSP_HEADER)
+            self.send_header("Content-Security-Policy", csp or _CSP_HEADER)
             self.send_header("X-Content-Type-Options", "nosniff")
             # session_id is the only guard on the URL — Referer
             # would leak it on every external link click.

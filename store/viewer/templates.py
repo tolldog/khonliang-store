@@ -195,7 +195,10 @@ _JS = (
         // own all artifacts in a local-trusted env.
         var html = marked.parse(raw);
         html = html.replace(/<script[\\s\\S]*?<\\/script>/gi, '');
-        html = html.replace(/ on[a-z]+\\s*=\\s*("[^"]*"|'[^']*'|[^\\s>]+)/gi, '');
+        // Match any whitespace before `on*=` — newlines and tabs
+        // are valid attribute separators per HTML5 (`<img\nonerror=...>`)
+        // and the original literal-space pattern missed them.
+        html = html.replace(/[\\s\\/]on[a-z]+\\s*=\\s*("[^"]*"|'[^']*'|[^\\s>]+)/gi, '');
         // Neutralize `javascript:` URI schemes in href/src
         // attributes — even with the CSP, an inline `<a href=
         // "javascript:...">` would still execute on click.
@@ -247,15 +250,19 @@ def render_session_page(
     layout: str,
     tabs: Iterable[object],
     rendered_panes: Mapping[str, str],
+    nonce: str,
 ) -> str:
     """Compose the full HTML for a session's view URL.
 
     ``rendered_panes`` is keyed by tab_id and holds the HTML fragment
     each renderer produced. ``tabs`` is the iteration order.
+    ``nonce`` is the per-response CSP nonce — emitted on every
+    inline ``<script>`` and ``<style>`` so the response's
+    Content-Security-Policy can drop ``'unsafe-inline'``.
     """
     tab_list = list(tabs)
     if not tab_list:
-        return _empty_session_page(session_id)
+        return _empty_session_page(session_id, nonce=nonce)
 
     tab_html_parts: list[str] = []
     pane_html_parts: list[str] = []
@@ -297,10 +304,11 @@ def render_session_page(
         panes_html="".join(pane_html_parts),
         session_meta=html.escape(json.dumps({"session_id": session_id, "layout": layout})),
         js=_JS,
+        nonce=html.escape(nonce, quote=True),
     )
 
 
-def _empty_session_page(session_id: str) -> str:
+def _empty_session_page(session_id: str, *, nonce: str) -> str:
     return _PAGE_SHELL.format(
         title=html.escape("khonliang-store viewer — empty session"),
         css=_CSS,
@@ -321,6 +329,7 @@ def _empty_session_page(session_id: str) -> str:
         ),
         session_meta=html.escape(json.dumps({"session_id": session_id})),
         js="",
+        nonce=html.escape(nonce, quote=True),
     )
 
 
@@ -330,7 +339,7 @@ _PAGE_SHELL = """<!doctype html>
 <meta charset="utf-8">
 <title>{title}</title>
 <link rel="stylesheet" href="{prism_css}" integrity="{prism_css_sri}" crossorigin="anonymous">
-<style>{css}</style>
+<style nonce="{nonce}">{css}</style>
 </head>
 <body data-meta="{session_meta}">
 <nav id="tabs" class="layout-{layout_class}">{tabs_html}</nav>
@@ -338,7 +347,7 @@ _PAGE_SHELL = """<!doctype html>
 <script src="{marked_cdn}" integrity="{marked_sri}" crossorigin="anonymous"></script>
 <script src="{prism_js}" integrity="{prism_js_sri}" crossorigin="anonymous"></script>
 <script src="{prism_autoloader}" integrity="{prism_autoloader_sri}" crossorigin="anonymous"></script>
-<script>{js}</script>
+<script nonce="{nonce}">{js}</script>
 </body>
 </html>
 """

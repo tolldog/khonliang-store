@@ -2,8 +2,10 @@
 
 Sessions own tabs; tabs hold an artifact reference (id + optional
 view_hint) plus enough metadata for the server to render. State is
-explicitly volatile — there's no durability surface (per the FR:
-"Persistence: none of its own. Every render fetches from bus/store.").
+explicitly volatile — there's no durability surface (the FR's
+"Persistence: none of its own" line stands; the FR's "every render
+fetches" wording was loosened during implementation, see the Tab
+docstring below for the actual fetch-at-display-time contract).
 
 Thread-safe: the HTTP server runs on a worker thread separate from
 whatever creates sessions, so all mutations go through a lock.
