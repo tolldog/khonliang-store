@@ -9,6 +9,21 @@ import pytest
 from store.viewer import renderers
 
 
+@pytest.fixture(autouse=True)
+def _isolate_renderer_registry():
+    """Snapshot + restore the module-global renderer registry.
+
+    Tests that call ``@register_renderer("test/...")`` would
+    otherwise leak entries into later tests; the registry is
+    module-global by design (it's the extension hook the FR calls
+    out). Per-test isolation keeps the convenience of the global
+    decorator without the test-order coupling.
+    """
+    snap = renderers._registry_snapshot()
+    yield
+    renderers._registry_restore(snap)
+
+
 def test_register_renderer_decorator_lookup():
     @renderers.register_renderer("test/widget")
     def _renderer(body, metadata):

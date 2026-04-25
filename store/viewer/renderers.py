@@ -38,6 +38,21 @@ RendererFn = Callable[[bytes, dict[str, Any]], str]
 _REGISTRY: dict[str, RendererFn] = {}
 
 
+def _registry_snapshot() -> dict[str, RendererFn]:
+    """Test-only hook: return a shallow copy of the renderer registry.
+
+    Pair with :func:`_registry_restore` in a fixture so a test that
+    registers a custom MIME type doesn't pollute later tests.
+    """
+    return dict(_REGISTRY)
+
+
+def _registry_restore(snapshot: dict[str, RendererFn]) -> None:
+    """Test-only hook: replace the registry contents with ``snapshot``."""
+    _REGISTRY.clear()
+    _REGISTRY.update(snapshot)
+
+
 def register_renderer(content_type: str) -> Callable[[RendererFn], RendererFn]:
     """Register a renderer for ``content_type`` (exact match).
 

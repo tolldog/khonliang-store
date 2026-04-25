@@ -36,6 +36,28 @@ from store.viewer.templates import render_session_page
 logger = logging.getLogger(__name__)
 
 
+# Content-Security-Policy applied to every viewer response.
+# Defense-in-depth on top of the markdown post-strip and the
+# local-trusted-environment posture: even if an artifact slips a
+# `<script>` past the JS sanitizer, the CSP refuses to execute
+# anything not from `self` or jsdelivr (the pinned-and-SRI'd CDN
+# we load marked + prism from). 'unsafe-inline' for scripts/styles
+# is required because the viewer's tab-handling JS and CSS are
+# inlined in the HTML; switching to a nonce-based policy is a
+# follow-up if untrusted-artifact rendering becomes a real use case.
+_CSP_HEADER = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "img-src 'self' data: blob: https:; "
+    "font-src 'self' data: https://cdn.jsdelivr.net; "
+    "connect-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'none'; "
+    "frame-ancestors 'none'"
+)
+
+
 class ViewerServer:
     """Thread-owned HTTP server holding viewer state.
 
@@ -263,6 +285,8 @@ def _make_handler(server: ViewerServer) -> type[BaseHTTPRequestHandler]:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Security-Policy", _CSP_HEADER)
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             if body:
                 self.wfile.write(body)
