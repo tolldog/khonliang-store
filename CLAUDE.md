@@ -8,15 +8,22 @@ FR with its own PR.
 
 ## Status
 
-Phase 3 viewer landed (`fr_store_d22556bb`): `display(artifacts,
-layout='tabs')` lazily starts an in-process HTTP viewer, pre-fetches
-artifacts via the bus, and returns a browser URL. Renderers are
-extensible via `@register_renderer("type/x")`.
+Phase 2 reads (`fr_store_08c1c6b2`): the store agent now owns the
+artifact read surface — `artifact_list / metadata / get / head /
+tail / grep / excerpt`. All seven route through an
+`ArtifactBackend` abstraction; today the shipped backend is
+`BusBackedArtifactStore`, an HTTP client against the bus's REST
+routes (where data still lives). Phase 4 swaps in a local SQLite
+backend without changing the skill surface or the viewer's
+fetch path.
 
-Phases 2 (artifact reads owned by store) and 4 (write ownership +
-bus surface deprecation) remain open. The viewer reads from the bus
-today and swaps to a local backend without renderer/server changes
-when Phase 4 lands.
+Phase 3 viewer (`fr_store_d22556bb`): `display(artifacts,
+layout='tabs')` lazily starts an in-process HTTP viewer,
+pre-fetches artifacts via the same `ArtifactBackend` (in-process
+call, no bus round-trip), and returns a browser URL. Renderers
+are extensible via `@register_renderer("type/x")`.
+
+Phase 4 (write ownership + bus surface deprecation) remains open.
 
 ## Stack
 
@@ -67,16 +74,19 @@ viewer skill.
 
 1. **Phase 1** ✅ shipped — scaffold, health_check, tests, CLI
    (`fr_store_4ea7d48b`).
-2. **Phase 2** — artifact read skills (get, list, metadata, head,
-   tail, grep, excerpt). Proxy to the bus artifact backend
-   initially. _Open._
+2. **Phase 2** ✅ shipped — artifact read skills (get, list,
+   metadata, head, tail, grep, excerpt) (`fr_store_08c1c6b2`).
+   Proxy to the bus artifact backend via
+   `BusBackedArtifactStore`; the `ArtifactBackend` ABC is the
+   swap point for Phase 4.
 3. **Phase 3** ✅ shipped — viewer mode (`fr_store_d22556bb`).
-   Browser URL for tabbed/split rendering. Graphviz, markdown, JSON
+   Browser URL for tabbed rendering. Graphviz, markdown, JSON
    tree, code highlighting; renderer registry extensible via
    `@register_renderer`.
 4. **Phase 4** — artifact write skills + ownership migration. The
-   store agent becomes the write path; the bus artifact surface
-   becomes a read-proxy or is removed. _Open._
+   store agent becomes the write path with a local SQLite
+   backend; the bus artifact surface becomes a read-proxy or is
+   removed. _Open._
 5. **Phase 5** — cross-reference from fr_researcher_000ad07c
    (`stage_payload` / `ingest_from_artifact`) once store owns the
    write path. _Open._
