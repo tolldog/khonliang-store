@@ -227,6 +227,21 @@ async def test_5xx_returns_error_envelope(make_handler):
 
 
 @pytest.mark.asyncio
+async def test_404_on_list_route_is_not_artifact_not_found(make_handler):
+    """A 404 against the collection route ``/v1/artifacts`` means
+    the route is missing or the bus URL is misconfigured. Mapping
+    that to "artifact not found" — appropriate for per-id routes —
+    would mislead operators debugging the bus integration.
+    """
+    backend, client = _make_backend(make_handler({}, status=404))
+    try:
+        result = await backend.list()
+    finally:
+        await client.aclose()
+    assert result == {"error": "bus returned HTTP 404"}
+
+
+@pytest.mark.asyncio
 async def test_connection_error_returns_unreachable_envelope():
     """Network failure must surface as an error envelope, not raise.
 
@@ -277,3 +292,25 @@ async def test_close_only_closes_owned_client():
     resp = await external.get("http://bus.example/v1/artifacts")
     assert resp.status_code == 200
     await external.aclose()
+
+
+@pytest.mark.asyncio
+async def test_abc_close_default_is_async_noop():
+    """A backend that doesn't own resources can inherit the ABC's
+    default ``async def close`` and ``await`` it without raising.
+    Locks in the contract that ``StoreAgent.shutdown`` relies on.
+    """
+    from store.artifacts import ArtifactBackend
+
+    class _Stateless(ArtifactBackend):
+        async def list(self, **kw): return []
+        async def metadata(self, _id): return {}
+        async def get(self, _id, **kw): return {}
+        async def head(self, _id, **kw): return {}
+        async def tail(self, _id, **kw): return {}
+        async def grep(self, _id, **kw): return {}
+        async def excerpt(self, _id, **kw): return {}
+
+    # Must be awaitable (returns a coroutine) and resolve to None.
+    result = await _Stateless().close()
+    assert result is None

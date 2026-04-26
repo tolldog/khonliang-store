@@ -97,17 +97,18 @@ class StoreAgent(BaseAgent):
         internal httpx client; the artifact backend has its own
         httpx client (the one that talks to the bus REST surface)
         which we own and must close too — otherwise process exit
-        emits "unclosed client" warnings.
+        emits "unclosed client" warnings. ``ArtifactBackend.close``
+        is part of the ABC contract (default no-op for stateless
+        backends), so we can call it directly without dynamic
+        lookup or shape guessing.
         """
-        close = getattr(self._backend, "close", None)
-        if close is not None:
-            try:
-                await close()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "store backend close raised %s: %s",
-                    type(exc).__name__, exc,
-                )
+        try:
+            await self._backend.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "store backend close raised %s: %s",
+                type(exc).__name__, exc,
+            )
         await super().shutdown()
 
     def register_skills(self) -> list[Skill]:

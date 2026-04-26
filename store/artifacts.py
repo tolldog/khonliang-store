@@ -114,6 +114,16 @@ class ArtifactBackend(abc.ABC):
         max_chars: int = 4000,
     ) -> dict[str, Any]: ...
 
+    async def close(self) -> None:
+        """Release resources owned by this backend.
+
+        Default no-op for stateless backends; concrete backends
+        that hold connections / file handles override. Declared
+        on the ABC as `async` so :meth:`StoreAgent.shutdown` can
+        ``await`` it without dynamic-attribute gymnastics or risk
+        of finding a sync override.
+        """
+
 
 class BusBackedArtifactStore(ArtifactBackend):
     """Read artifacts from the bus's REST surface over HTTP.
@@ -160,7 +170,12 @@ class BusBackedArtifactStore(ArtifactBackend):
             "producer": producer,
             "limit": limit,
         }
-        result = await self._get_json("/v1/artifacts", params=params)
+        # is_id_route=False: a 404 here means the route is gone or
+        # the bus_url is wrong, NOT "artifact not found" (that
+        # translation only makes sense for per-id routes below).
+        result = await self._get_json(
+            "/v1/artifacts", params=params, is_id_route=False
+        )
         if isinstance(result, list):
             return result
         # Preserve error envelopes (network failure / 4xx / 5xx /
@@ -252,13 +267,23 @@ class BusBackedArtifactStore(ArtifactBackend):
         path: str,
         *,
         params: Optional[dict[str, Any]] = None,
+        is_id_route: bool = True,
     ) -> Any:
+        """GET ``path`` and decode the JSON body.
+
+        ``is_id_route``: True for paths that target a specific
+        artifact id (where 404 means "artifact not found"). False
+        for collection / health routes where 404 means "bus
+        misconfigured" — those fall through to the generic HTTP
+        error envelope so callers don't see a misleading "artifact
+        not found" for a missing-route problem.
+        """
         url = f"{self._bus_url}{path}"
         try:
             resp = await self._client.get(url, params=params or {})
         except httpx.HTTPError as exc:
             return {"error": f"bus unreachable: {type(exc).__name__}: {exc}"}
-        if resp.status_code == 404:
+        if resp.status_code == 404 and is_id_route:
             return {"error": "artifact not found"}
         if resp.status_code >= 400:
             return {"error": f"bus returned HTTP {resp.status_code}"}
