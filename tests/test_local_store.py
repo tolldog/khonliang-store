@@ -96,6 +96,24 @@ async def test_create_rejects_duplicate_id(backend):
 
 
 @pytest.mark.asyncio
+async def test_duplicate_id_failure_doesnt_lock_subsequent_writes(backend):
+    """The IntegrityError from a duplicate-id INSERT must trigger
+    a rollback; otherwise sqlite3's implicit transaction stays
+    aborted and the next write fails with "cannot operate on an
+    aborted transaction" (or the DB stays locked under WAL).
+    """
+    await backend.create(kind="note", title="A", content="x", artifact_id="art_x")
+    err = await backend.create(kind="note", title="B", content="y", artifact_id="art_x")
+    assert "error" in err
+    # Subsequent unrelated write must succeed — proves the
+    # transaction was rolled back rather than left in the failed
+    # state.
+    next_ok = await backend.create(kind="note", title="C", content="z")
+    assert next_ok.get("id", "").startswith("art_")
+    assert next_ok["title"] == "C"
+
+
+@pytest.mark.asyncio
 async def test_create_persists_metadata_and_source_artifacts_as_json(backend):
     meta = await backend.create(
         kind="note", title="t", content="c",
@@ -223,6 +241,23 @@ async def test_tail_includes_line_range_metadata(backend):
     assert payload["end_line"] == 10
 
 
+@pytest.mark.asyncio
+async def test_tail_with_zero_lines_signals_empty_via_zero_range(backend):
+    """``lines=0`` selects nothing. Previously ``start_line``
+    came back as ``len(content_lines)+1`` while ``end_line``
+    stayed at ``len`` — start > end, broken invariant. Now both
+    collapse to 0 to signal "no content" without violating the
+    line-range contract.
+    """
+    body = "\n".join(f"line {i}" for i in range(5))
+    created = await backend.create(kind="note", title="t", content=body)
+    payload = await backend.tail(created["id"], lines=0)
+    assert payload["text"] == ""
+    assert payload["start_line"] == 0
+    assert payload["end_line"] == 0
+    assert payload["start_line"] <= payload["end_line"]
+
+
 # -- excerpt ------------------------------------------------------------------
 
 
@@ -234,6 +269,22 @@ async def test_excerpt_returns_inclusive_range(backend):
     assert payload["text"] == "line 2\nline 3\nline 4"
     assert payload["start_line"] == 3
     assert payload["end_line"] == 5
+
+
+@pytest.mark.asyncio
+async def test_excerpt_past_eof_signals_empty_via_zero_range(backend):
+    """Same line-range invariant as tail: when ``start_line`` is
+    beyond the artifact's last line, the response previously
+    reported ``start_line=<requested>`` and ``end_line=<len>``,
+    yielding ``start > end``. Now both collapse to 0.
+    """
+    body = "line 0\nline 1\nline 2"  # 3 lines
+    created = await backend.create(kind="note", title="t", content=body)
+    payload = await backend.excerpt(created["id"], start_line=10, end_line=20)
+    assert payload["text"] == ""
+    assert payload["start_line"] == 0
+    assert payload["end_line"] == 0
+    assert payload["start_line"] <= payload["end_line"]
 
 
 # -- grep ---------------------------------------------------------------------

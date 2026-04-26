@@ -187,6 +187,14 @@ class LocalArtifactStore(ArtifactBackend):
                 )
                 conn.commit()
             except sqlite3.IntegrityError as exc:
+                # Python's sqlite3 driver opens an implicit
+                # transaction for the INSERT; if the statement
+                # raises, the transaction is left "aborted" until
+                # we explicitly roll back. Skipping the rollback
+                # would leave subsequent writes failing with
+                # "cannot operate on an aborted transaction" and
+                # could keep the DB locked.
+                conn.rollback()
                 return {"error": f"duplicate artifact id: {exc}"}
         return self._sync_metadata(artifact_id) or {"error": "create succeeded but metadata read failed"}
 
@@ -309,9 +317,19 @@ class LocalArtifactStore(ArtifactBackend):
             return {"error": "artifact not found"}
         n = _clamp_lines(lines)
         selected = content_lines[-n:] if n else []
-        start = max(1, len(content_lines) - len(selected) + 1)
         bounded = _bound_lines(selected, max_chars, truncated=len(content_lines) > n)
-        bounded = _BoundedText(bounded.text, bounded.truncated, start, len(content_lines))
+        # When ``selected`` is empty (lines=0 or empty artifact)
+        # the previous code produced ``start_line > end_line`` —
+        # ``start = len + 1`` while ``end = len``. Signal "no
+        # content" via (0, 0) instead so the line-range
+        # invariant holds across all return paths.
+        if not selected:
+            bounded = _BoundedText(bounded.text, bounded.truncated, 0, 0)
+        else:
+            start = len(content_lines) - len(selected) + 1
+            bounded = _BoundedText(
+                bounded.text, bounded.truncated, start, len(content_lines),
+            )
         return _view(meta, bounded)
 
     async def grep(
@@ -403,10 +421,18 @@ class LocalArtifactStore(ArtifactBackend):
             selected, max_chars,
             truncated=end_line < len(content_lines),
         )
-        bounded = _BoundedText(
-            bounded.text, bounded.truncated,
-            start_line, min(end_line, len(content_lines)),
-        )
+        if not selected:
+            # ``start_line`` past EOF (or the slice happens to be
+            # empty for some other reason) — the previous code
+            # would emit ``start_line=<requested>, end_line=<len>``
+            # which violates start ≤ end. Signal "no content" via
+            # (0, 0) consistent with the same pattern in tail().
+            bounded = _BoundedText(bounded.text, bounded.truncated, 0, 0)
+        else:
+            bounded = _BoundedText(
+                bounded.text, bounded.truncated,
+                start_line, min(end_line, len(content_lines)),
+            )
         return _view(meta, bounded)
 
     # -- internals --------------------------------------------------------
