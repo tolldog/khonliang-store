@@ -118,6 +118,36 @@ class ArtifactBackend(abc.ABC):
         max_chars: int = 4000,
     ) -> dict[str, Any]: ...
 
+    async def create(
+        self,
+        *,
+        kind: str,
+        title: str,
+        content: str,
+        producer: str = "",
+        session_id: str = "",
+        trace_id: str = "",
+        content_type: str = "text/plain",
+        metadata: Optional[dict[str, Any]] = None,
+        source_artifacts: Optional[list[str]] = None,
+        artifact_id: str = "",
+        ttl: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Create a new artifact.
+
+        Default raises ``NotImplementedError`` so read-only
+        backends (today: :class:`BusBackedArtifactStore`) don't
+        need an explicit override. Concrete write-capable
+        backends — currently only :class:`LocalArtifactStore` —
+        override with the persisting implementation. Returns the
+        new artifact's metadata on success, or
+        ``{"error": ...}`` on validation failure (size cap,
+        duplicate id, etc.).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} is read-only; create not supported"
+        )
+
     async def close(self) -> None:
         """Release resources owned by this backend.
 

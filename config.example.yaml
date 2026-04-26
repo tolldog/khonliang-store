@@ -4,7 +4,19 @@
 # Bus URL this agent registers with.
 bus_url: http://localhost:8788
 
-# Local filesystem path for the store agent's artifact backend. Not yet
-# used by Phase 1 (scaffold-only) — future FRs that add artifact
-# skills will write here.
-data_path: data/
+# Artifact backend selection. The default ("bus") preserves the
+# Phase-2 behavior: store proxies all reads to the bus's REST
+# routes and rejects writes (the bus owns the data today). Set
+# to "local" to switch on the Phase-4a SQLite-backed write path
+# — store-side artifact_create will then persist locally and all
+# reads come from the local DB.
+#
+# Phase 4b will add a "composite" mode that unions local writes
+# with bus-fallback reads; until then, switching to "local" makes
+# bus-resident artifacts invisible to the store agent.
+artifacts:
+  backend: bus      # bus | local
+  # Path to the SQLite file when backend=local. Relative paths
+  # resolve against the directory containing this config file.
+  # Default: store_artifacts.db next to the config.
+  # db_path: data/store_artifacts.db
