@@ -125,6 +125,22 @@ async def test_create_persists_metadata_and_source_artifacts_as_json(backend):
     assert meta["source_artifacts"] == ["art_a", "art_b"]
 
 
+@pytest.mark.asyncio
+async def test_create_rejects_non_json_serializable_metadata(backend):
+    """``json.dumps`` raises ``TypeError`` on unsupported types
+    (datetime, bytes, set). The handler must catch that and
+    return a clean envelope rather than letting the exception
+    bubble up and crash the skill call.
+    """
+    import datetime
+    result = await backend.create(
+        kind="note", title="t", content="c",
+        metadata={"when": datetime.datetime.now()},
+    )
+    assert "error" in result
+    assert "JSON-serializable" in result["error"]
+
+
 # -- metadata -----------------------------------------------------------------
 
 
@@ -188,6 +204,19 @@ async def test_list_clamps_limit_to_hard_max(backend):
     items = await backend.list(limit=MAX_LIST_LIMIT * 10)
     assert isinstance(items, list)
     assert len(items) <= MAX_LIST_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_list_with_zero_limit_returns_empty(backend):
+    """``limit=0`` is a "does anything match?" query — the
+    answer must be ``[]``, not a one-row "best effort". Previous
+    behavior clamped to 1 and returned a row the caller didn't
+    ask for.
+    """
+    for i in range(3):
+        await backend.create(kind="note", title=f"a-{i}", content="x")
+    items = await backend.list(limit=0)
+    assert items == []
 
 
 # -- get ----------------------------------------------------------------------
@@ -328,6 +357,24 @@ async def test_grep_invalid_regex_returns_error(backend):
     payload = await backend.grep(created["id"], pattern="[")
     assert "error" in payload
     assert "invalid regex" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_grep_with_zero_max_matches_returns_count_only(backend):
+    """``max_matches=0`` is a "count, don't return" query —
+    response carries ``matches=N, returned_matches=0`` so the
+    caller can probe for hits cheaply. Previous behavior clamped
+    to 1 and returned the first match's content block whether
+    the caller wanted it or not.
+    """
+    body = "alpha\nfoo\nbeta\nfoo\ngamma"
+    created = await backend.create(kind="note", title="t", content=body)
+    payload = await backend.grep(
+        created["id"], pattern=r"foo", max_matches=0,
+    )
+    assert payload["matches"] == 2
+    assert payload["returned_matches"] == 0
+    assert payload["text"] == ""
 
 
 # -- close --------------------------------------------------------------------

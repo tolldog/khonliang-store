@@ -21,12 +21,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
+
+
+logger = logging.getLogger(__name__)
 
 from store.artifacts import ArtifactBackend, ListResult
 
@@ -153,8 +157,22 @@ class LocalArtifactStore(ArtifactBackend):
             }
         new_id = artifact_id or f"art_{uuid.uuid4().hex[:12]}"
         sha = hashlib.sha256(raw).hexdigest()
-        meta_json = json.dumps(metadata or {}, sort_keys=True)
-        sources_json = json.dumps(source_artifacts or [], sort_keys=True)
+        try:
+            meta_json = json.dumps(metadata or {}, sort_keys=True)
+            sources_json = json.dumps(source_artifacts or [], sort_keys=True)
+        except TypeError as exc:
+            # ``metadata`` is annotated as ``dict[str, Any]`` but
+            # callers can supply non-JSON-serializable values
+            # (datetime, bytes, set). Catch here so the handler
+            # surfaces a clean error envelope instead of letting
+            # the exception bubble up and fail the skill call.
+            logger.warning(
+                "rejecting non-JSON-serializable metadata/source_artifacts: %s",
+                exc,
+            )
+            return {
+                "error": "metadata and source_artifacts must be JSON-serializable",
+            }
         return await asyncio.to_thread(
             self._sync_create,
             new_id, kind, title, producer, session_id, trace_id,
@@ -196,6 +214,23 @@ class LocalArtifactStore(ArtifactBackend):
                 # could keep the DB locked.
                 conn.rollback()
                 return {"error": f"duplicate artifact id: {exc}"}
+            except sqlite3.Error as exc:
+                # OperationalError (DB locked / disk I/O), DatabaseError
+                # (corruption), and other sqlite3.Error subclasses
+                # would otherwise propagate out of the skill
+                # handler as exceptions; the read-side methods
+                # all return ``{"error": ...}`` envelopes so the
+                # write side honors the same contract. Log the
+                # full exception under our logger for forensics
+                # — the envelope keeps to a stable string so
+                # internal-state details don't leak to bus
+                # clients.
+                conn.rollback()
+                logger.warning(
+                    "local store error during create: %s: %s",
+                    type(exc).__name__, exc, exc_info=True,
+                )
+                return {"error": "local store error"}
         return self._sync_metadata(artifact_id) or {"error": "create succeeded but metadata read failed"}
 
     # -- ArtifactBackend reads -------------------------------------------
@@ -233,7 +268,15 @@ class LocalArtifactStore(ArtifactBackend):
     def _sync_list(
         self, session_id: str, kind: str, producer: str, limit: int,
     ) -> list[dict[str, Any]]:
-        clamped = max(1, min(int(limit), MAX_LIST_LIMIT))
+        # Clamp to ``[0, MAX_LIST_LIMIT]`` rather than
+        # ``[1, MAX_LIST_LIMIT]``: a caller asking for ``limit=0``
+        # is asking "is anything matching?" without paying for
+        # the rows, and the right answer is ``[]`` — silently
+        # bumping to 1 (the previous behavior) returns content
+        # they didn't want.
+        clamped = max(0, min(int(limit), MAX_LIST_LIMIT))
+        if clamped == 0:
+            return []
         clauses, params = [], []
         if session_id:
             clauses.append("session_id = ?")
@@ -364,7 +407,13 @@ class LocalArtifactStore(ArtifactBackend):
         except KeyError:
             return {"error": "artifact not found"}
         ctx = max(0, min(int(context_lines), MAX_GREP_CONTEXT_LINES))
-        cap = max(1, min(int(max_matches), MAX_GREP_MATCHES))
+        # ``max_matches=0`` is a legitimate "count, don't return"
+        # query — useful when the caller only needs to know
+        # whether matches exist. Clamp to ``[0, MAX_GREP_MATCHES]``
+        # rather than ``[1, ...]`` so the response can carry
+        # ``matches=N, returned_matches=0`` instead of forcing
+        # at least one block back.
+        cap = max(0, min(int(max_matches), MAX_GREP_MATCHES))
 
         blocks: list[str] = []
         matches = 0
