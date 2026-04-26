@@ -241,6 +241,12 @@ class StoreAgent(BaseAgent):
             producer=str(args.get("producer") or ""),
             limit=_int_arg(args, "limit", 20),
         )
+        # Pass error envelopes through verbatim — wrapping them as
+        # {"artifacts": {"error": ...}} would let a callsite that
+        # only checks for the top-level "error" key happily render
+        # an "outage" envelope as a (corrupted) artifact list.
+        if isinstance(items, dict) and "error" in items:
+            return items
         return {"artifacts": items}
 
     @handler("artifact_metadata")

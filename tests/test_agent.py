@@ -284,6 +284,19 @@ async def test_artifact_list_uses_defaults_when_args_missing(harness, backend):
     assert kwargs["session_id"] == ""
 
 
+@pytest.mark.asyncio
+async def test_artifact_list_passes_error_envelope_through(harness, backend):
+    """Backend can emit an error envelope (`{'error': ...}`) on
+    network/5xx; the handler must pass it through unwrapped, the
+    same way the other read skills do, so callers that check
+    ``result.get('error')`` see the failure rather than a
+    corrupted ``{'artifacts': {'error': ...}}`` shape.
+    """
+    backend.response = {"error": "bus returned HTTP 500"}
+    result = await harness.call("artifact_list", {})
+    assert result == {"error": "bus returned HTTP 500"}
+
+
 # -- artifact_metadata --------------------------------------------------------
 
 
