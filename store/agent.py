@@ -687,7 +687,12 @@ class StoreAgent(BaseAgent):
         for meta in page:
             if not isinstance(meta, dict):
                 continue
-            aid = str(meta.get("id") or "")
+            # Strip whitespace to match the normalization done in
+            # ``_required_id`` / ``handle_artifact_create``;
+            # otherwise a whitespace-suffixed id round-trips into
+            # local SQLite with the suffix and never matches a
+            # subsequent ``art_xyz`` read.
+            aid = str(meta.get("id") or "").strip()
             scanned += 1
             outcome = await _migrate_one(
                 aid=aid, meta=meta,
@@ -951,6 +956,23 @@ async def _migrate_one(
         return "non-string content"
     if dry_run:
         return "copied"
+    raw_sources = meta.get("source_artifacts")
+    sources = (
+        # Coerce every element to ``str`` to match
+        # ``handle_artifact_create``'s normalization (avoids
+        # persisting unexpected element types like ints).
+        [str(s) for s in raw_sources]
+        if isinstance(raw_sources, list)
+        else []
+    )
+    raw_ttl = meta.get("ttl")
+    # Normalize ttl the same way the create handler does:
+    # ``""``/whitespace-only collapses to ``None`` so we don't
+    # persist an empty-string TTL that the type system reads as
+    # "has TTL".
+    ttl: Optional[str] = (
+        (str(raw_ttl).strip() or None) if raw_ttl is not None else None
+    )
     try:
         result = await target.create(
             kind=kind,
@@ -961,13 +983,9 @@ async def _migrate_one(
             trace_id=str(meta.get("trace_id") or ""),
             content_type=str(meta.get("content_type") or "text/plain"),
             metadata=meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {},
-            source_artifacts=(
-                meta.get("source_artifacts")
-                if isinstance(meta.get("source_artifacts"), list)
-                else []
-            ),
+            source_artifacts=sources,
             artifact_id=aid,
-            ttl=meta.get("ttl"),
+            ttl=ttl,
         )
     except NotImplementedError as exc:
         # ABC default raise (read-only backend) — should be
