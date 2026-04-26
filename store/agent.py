@@ -7,18 +7,21 @@ Phase 3 (``fr_store_d22556bb``) added the first real skill,
 ``display(artifacts)``, which lazily starts an HTTP viewer in a
 worker thread and returns a URL the caller can open in a browser.
 Phase 2 (``fr_store_08c1c6b2``) adds the artifact read surface:
-``artifact_get / list / metadata / head / tail / grep / excerpt``,
-all routed through an :class:`ArtifactBackend` that today proxies
-to the bus's REST surface. Phase 4 will swap in a SQLite-backed
-local backend without touching the skill surface or the viewer.
+``artifact_get``, ``artifact_list``, ``artifact_metadata``,
+``artifact_head``, ``artifact_tail``, ``artifact_grep``,
+``artifact_excerpt``, all routed through an
+:class:`ArtifactBackend` that today proxies to the bus's REST
+surface. Phase 4 will swap in a SQLite-backed local backend
+without touching the skill surface or the viewer.
 
 Current skill surface:
     - ``health_check`` — inherited from :class:`BaseAgent`.
     - ``display(artifacts, layout='tabs')`` — lazy-start viewer,
       register tabs, return ``{url, session_id, tab_ids}``.
-    - ``artifact_list / metadata / get / head / tail / grep /
-      excerpt`` — bus-backed reads, response shape mirrors what
-      bus emits today.
+    - ``artifact_get``, ``artifact_list``, ``artifact_metadata``,
+      ``artifact_head``, ``artifact_tail``, ``artifact_grep``,
+      ``artifact_excerpt`` — bus-backed reads, response shape
+      mirrors what bus emits today.
 
 Usage::
 

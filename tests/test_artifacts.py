@@ -24,8 +24,14 @@ def _make_backend(handler):
 
 
 @pytest.fixture
-async def http_log():
-    """Capture every (method, url, params) for assertion."""
+def http_log():
+    """Capture every (method, url, params) for assertion.
+
+    Sync fixture: it's just a list and there's nothing to await.
+    Was previously declared async, which can trip pytest-asyncio's
+    fixture-resolution rules when consumed by sync fixtures like
+    :func:`make_handler`.
+    """
     return []
 
 

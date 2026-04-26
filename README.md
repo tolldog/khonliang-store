@@ -8,12 +8,13 @@ of a browser-based viewer mode for rendered artifacts.
 
 Registered bus agent. Skill surface today:
 
-- **Read API** — `artifact_list / metadata / get / head / tail /
-  grep / excerpt`. All seven route through an `ArtifactBackend`
-  abstraction. The shipped backend is `BusBackedArtifactStore`,
-  an HTTP client against the bus's REST routes (where data still
-  lives). Phase 4 swaps in a local SQLite backend without
-  changing the skill surface.
+- **Read API** — `artifact_list`, `artifact_metadata`,
+  `artifact_get`, `artifact_head`, `artifact_tail`,
+  `artifact_grep`, `artifact_excerpt`. All seven route through
+  an `ArtifactBackend` abstraction. The shipped backend is
+  `BusBackedArtifactStore`, an HTTP client against the bus's
+  REST routes (where data still lives). Phase 4 swaps in a
+  local SQLite backend without changing the skill surface.
 - **`display(artifacts, layout='tabs')`** — lazy in-process HTTP
   viewer that pre-fetches via the same `ArtifactBackend`
   (in-process call, no bus round-trip), and returns a browser

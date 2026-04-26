@@ -9,9 +9,10 @@ FR with its own PR.
 ## Status
 
 Phase 2 reads (`fr_store_08c1c6b2`): the store agent now owns the
-artifact read surface — `artifact_list / metadata / get / head /
-tail / grep / excerpt`. All seven route through an
-`ArtifactBackend` abstraction; today the shipped backend is
+artifact read surface — `artifact_list`, `artifact_metadata`,
+`artifact_get`, `artifact_head`, `artifact_tail`, `artifact_grep`,
+`artifact_excerpt`. All seven route through an `ArtifactBackend`
+abstraction; today the shipped backend is
 `BusBackedArtifactStore`, an HTTP client against the bus's REST
 routes (where data still lives). Phase 4 swaps in a local SQLite
 backend without changing the skill surface or the viewer's
