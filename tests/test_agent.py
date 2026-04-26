@@ -13,7 +13,7 @@ from typing import Any, Optional
 import pytest
 from khonliang_bus.testing import AgentTestHarness
 
-from store.agent import StoreAgent, _parse_artifact_refs
+from store.agent import StoreAgent, _parse_artifact_refs, _VIEWER_FETCH_CAP_CHARS
 from store.artifacts import ArtifactBackend
 from store.viewer import ArtifactRef
 from store.viewer import server as viewer_server
@@ -181,9 +181,13 @@ async def test_display_handler_returns_url_session_and_tab_ids(harness, backend)
     assert result["url"].endswith(f"/view/{result['session_id']}")
     assert len(result["tab_ids"]) == 1
     # Display routes through the backend in-process — no bus
-    # round-trip — and asks for the full content window so the
-    # renderer has the whole artifact, not a 4000-char prefix.
-    assert backend.calls == [("get", {"id": "art_aaa", "offset": 0, "max_chars": 2_000_000})]
+    # round-trip — and asks for the viewer-sized cap (well above
+    # the read skills' 4000-char token-budget default) so a
+    # normal-sized artifact renders in full.
+    assert backend.calls == [(
+        "get",
+        {"id": "art_aaa", "offset": 0, "max_chars": _VIEWER_FETCH_CAP_CHARS},
+    )]
 
 
 @pytest.mark.asyncio
@@ -345,6 +349,27 @@ async def test_artifact_get_coerces_string_numerics(harness, backend):
     await harness.call("artifact_get", {"id": "art_a", "offset": "100", "max_chars": "50"})
     op, kwargs = backend.calls[0]
     assert kwargs == {"id": "art_a", "offset": 100, "max_chars": 50}
+
+
+@pytest.mark.asyncio
+async def test_artifact_get_rejects_bad_offset(harness, backend):
+    """Provided-but-non-numeric ints are an explicit error rather
+    than a silent fallback to default. Silent fallback would mean
+    ``offset='abc'`` becomes ``offset=0`` and starts returning
+    different content than the caller asked for.
+    """
+    result = await harness.call("artifact_get", {"id": "art_a", "offset": "abc"})
+    assert result == {"error": "offset must be an integer"}
+    assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_artifact_grep_rejects_bad_max_chars(harness, backend):
+    result = await harness.call("artifact_grep", {
+        "id": "art_a", "pattern": "needle", "max_chars": "wat",
+    })
+    assert result == {"error": "max_chars must be an integer"}
+    assert backend.calls == []
 
 
 # -- artifact_head / tail -----------------------------------------------------

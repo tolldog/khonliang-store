@@ -56,6 +56,15 @@ logger = logging.getLogger(__name__)
 # latency-bound (rather than CPU-bound) fetches don't serialize.
 _FETCH_CONCURRENCY = 8
 
+# Per-tab content cap for the viewer fetch. Sized so the renderer
+# sees the artifact body in full for any artifact under ~2 MiB —
+# orders of magnitude above the ``max_chars=4000`` token-budget
+# default the read skills use. A larger artifact will be truncated
+# at this boundary; the alternative (no cap, or a streamed body)
+# would let a single huge artifact dominate the viewer's process
+# memory, and the renderer pipeline assumes bytes-in-memory anyway.
+_VIEWER_FETCH_CAP_CHARS = 2_000_000
+
 
 class StoreAgent(BaseAgent):
     """Bus-native store agent.
@@ -236,11 +245,15 @@ class StoreAgent(BaseAgent):
 
     @handler("artifact_list")
     async def handle_artifact_list(self, args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            limit = _int_arg(args, "limit", 20)
+        except ValueError as exc:
+            return {"error": str(exc)}
         items = await self._backend.list(
             session_id=str(args.get("session_id") or ""),
             kind=str(args.get("kind") or ""),
             producer=str(args.get("producer") or ""),
-            limit=_int_arg(args, "limit", 20),
+            limit=limit,
         )
         # Pass error envelopes through verbatim — wrapping them as
         # {"artifacts": {"error": ...}} would let a callsite that
@@ -262,10 +275,13 @@ class StoreAgent(BaseAgent):
         artifact_id = _required_id(args)
         if not artifact_id:
             return {"error": "id is required"}
+        try:
+            offset = _int_arg(args, "offset", 0)
+            max_chars = _int_arg(args, "max_chars", 4000)
+        except ValueError as exc:
+            return {"error": str(exc)}
         return await self._backend.get(
-            artifact_id,
-            offset=_int_arg(args, "offset", 0),
-            max_chars=_int_arg(args, "max_chars", 4000),
+            artifact_id, offset=offset, max_chars=max_chars,
         )
 
     @handler("artifact_head")
@@ -273,10 +289,13 @@ class StoreAgent(BaseAgent):
         artifact_id = _required_id(args)
         if not artifact_id:
             return {"error": "id is required"}
+        try:
+            lines = _int_arg(args, "lines", 80)
+            max_chars = _int_arg(args, "max_chars", 4000)
+        except ValueError as exc:
+            return {"error": str(exc)}
         return await self._backend.head(
-            artifact_id,
-            lines=_int_arg(args, "lines", 80),
-            max_chars=_int_arg(args, "max_chars", 4000),
+            artifact_id, lines=lines, max_chars=max_chars,
         )
 
     @handler("artifact_tail")
@@ -284,10 +303,13 @@ class StoreAgent(BaseAgent):
         artifact_id = _required_id(args)
         if not artifact_id:
             return {"error": "id is required"}
+        try:
+            lines = _int_arg(args, "lines", 80)
+            max_chars = _int_arg(args, "max_chars", 4000)
+        except ValueError as exc:
+            return {"error": str(exc)}
         return await self._backend.tail(
-            artifact_id,
-            lines=_int_arg(args, "lines", 80),
-            max_chars=_int_arg(args, "max_chars", 4000),
+            artifact_id, lines=lines, max_chars=max_chars,
         )
 
     @handler("artifact_grep")
@@ -298,12 +320,18 @@ class StoreAgent(BaseAgent):
         pattern = str(args.get("pattern") or "")
         if not pattern:
             return {"error": "pattern is required"}
+        try:
+            context_lines = _int_arg(args, "context_lines", 10)
+            max_matches = _int_arg(args, "max_matches", 10)
+            max_chars = _int_arg(args, "max_chars", 4000)
+        except ValueError as exc:
+            return {"error": str(exc)}
         return await self._backend.grep(
             artifact_id,
             pattern=pattern,
-            context_lines=_int_arg(args, "context_lines", 10),
-            max_matches=_int_arg(args, "max_matches", 10),
-            max_chars=_int_arg(args, "max_chars", 4000),
+            context_lines=context_lines,
+            max_matches=max_matches,
+            max_chars=max_chars,
         )
 
     @handler("artifact_excerpt")
@@ -320,11 +348,12 @@ class StoreAgent(BaseAgent):
             end = int(end_line)
         except (TypeError, ValueError):
             return {"error": "start_line and end_line must be integers"}
+        try:
+            max_chars = _int_arg(args, "max_chars", 4000)
+        except ValueError as exc:
+            return {"error": str(exc)}
         return await self._backend.excerpt(
-            artifact_id,
-            start_line=start,
-            end_line=end,
-            max_chars=_int_arg(args, "max_chars", 4000),
+            artifact_id, start_line=start, end_line=end, max_chars=max_chars,
         )
 
     # -- display ----------------------------------------------------------
@@ -401,14 +430,16 @@ class StoreAgent(BaseAgent):
         correct path. Phase 4 swaps ``self._backend`` for a local
         SQLite implementation without touching this method.
         """
-        # Pull the full content window so the renderer has the
-        # whole artifact; bumped well above the default 4000-char
-        # cap because the viewer is the one consumer that wants
-        # the body, not a token-budgeted excerpt.
+        # Cap the body at :data:`_VIEWER_FETCH_CAP_CHARS`. Sized so
+        # any artifact under ~2 MiB renders in full; larger
+        # artifacts are truncated at the cap (the renderer
+        # pipeline holds bytes-in-memory, so unbounded fetches
+        # would let a single huge artifact dominate the viewer's
+        # process memory).
         payload = await self._backend.get(
             artifact_id,
             offset=0,
-            max_chars=2_000_000,
+            max_chars=_VIEWER_FETCH_CAP_CHARS,
         )
         if not isinstance(payload, dict):
             raise RuntimeError(
@@ -437,18 +468,23 @@ def _required_id(args: dict[str, Any]) -> str:
 
 
 def _int_arg(args: dict[str, Any], name: str, default: int) -> int:
-    """Coerce ``args[name]`` to int, falling back to default for None / bad shapes.
+    """Coerce ``args[name]`` to int.
 
-    Bus clients sometimes hand args through JSON which can preserve
-    string-typed numerics for default-bearing fields; tolerate that.
+    Missing / empty values fall back to ``default``. String-typed
+    numerics ('100' from a JSON payload) are accepted. Anything
+    else (provided but not coercible) raises ``ValueError`` so the
+    caller can return an explicit ``{"error": ...}`` envelope —
+    silently swallowing junk input would change request semantics
+    (offset='abc' silently becomes offset=0) and is exactly the
+    kind of corruption that's hard to debug after the fact.
     """
     value = args.get(name)
     if value is None or value == "":
         return default
     try:
         return int(value)
-    except (TypeError, ValueError):
-        return default
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
 
 
 def _parse_artifact_refs(raw: Any) -> list[ArtifactRef]:
