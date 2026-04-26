@@ -8,15 +8,20 @@ FR with its own PR.
 
 ## Status
 
-Phase 2 reads (`fr_store_08c1c6b2`): the store agent now owns the
+Phase 4a (`fr_store_73e5a6f4`): `LocalArtifactStore` (SQLite-backed
+implementation of `ArtifactBackend`) plus `artifact_create` skill.
+Backend selection is config-driven (`[artifacts] backend: local |
+bus`) and defaults to `bus` to preserve Phase-2 behavior; flip to
+`local` to write through to the new local DB. The bus REST surface
+keeps owning existing data until Phase 4b lands the composite
+backend that unions local + bus reads.
+
+Phase 2 reads (`fr_store_08c1c6b2`): the store agent owns the
 artifact read surface — `artifact_list`, `artifact_metadata`,
 `artifact_get`, `artifact_head`, `artifact_tail`, `artifact_grep`,
 `artifact_excerpt`. All seven route through an `ArtifactBackend`
-abstraction; today the shipped backend is
-`BusBackedArtifactStore`, an HTTP client against the bus's REST
-routes (where data still lives). Phase 4 swaps in a local SQLite
-backend without changing the skill surface or the viewer's
-fetch path.
+abstraction; the same abstraction now serves both
+`BusBackedArtifactStore` (proxy) and `LocalArtifactStore` (own).
 
 Phase 3 viewer (`fr_store_d22556bb`): `display(artifacts,
 layout='tabs')` lazily starts an in-process HTTP viewer,
@@ -24,7 +29,8 @@ pre-fetches artifacts via the same `ArtifactBackend` (in-process
 call, no bus round-trip), and returns a browser URL. Renderers
 are extensible via `@register_renderer("type/x")`.
 
-Phase 4 (write ownership + bus surface deprecation) remains open.
+Phase 4b (composite read backend + bus → local migration) and
+Phase 4c (bus REST surface deprecation) remain open.
 
 ## Stack
 
@@ -84,11 +90,17 @@ viewer skill.
    Browser URL for tabbed rendering. Graphviz, markdown, JSON
    tree, code highlighting; renderer registry extensible via
    `@register_renderer`.
-4. **Phase 4** — artifact write skills + ownership migration. The
-   store agent becomes the write path with a local SQLite
-   backend; the bus artifact surface becomes a read-proxy or is
-   removed. _Open._
-5. **Phase 5** — cross-reference from fr_researcher_000ad07c
+4. **Phase 4a** ✅ shipped — `LocalArtifactStore` (SQLite) +
+   `artifact_create` skill (`fr_store_73e5a6f4`). Config-gated
+   default keeps the bus backend as the read source until 4b
+   lands the union-read.
+5. **Phase 4b** — `CompositeArtifactBackend(local, bus_fallback)`
+   so newly-created artifacts and bus-resident artifacts both
+   appear in store reads, plus migration tooling that copies
+   bus's existing artifacts into the local DB. _Open._
+6. **Phase 4c** — deprecate bus's `bus_artifact_*` HTTP surface
+   once 4b's migration has run cleanly. _Open._
+7. **Phase 5** — cross-reference from fr_researcher_000ad07c
    (`stage_payload` / `ingest_from_artifact`) once store owns the
    write path. _Open._
 

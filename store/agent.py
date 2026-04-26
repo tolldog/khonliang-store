@@ -41,12 +41,15 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
+import yaml
 from khonliang_bus import BaseAgent, Skill, handler
 
 from store.artifacts import ArtifactBackend, BusBackedArtifactStore
+from store.local_store import LocalArtifactStore
 from store.viewer import ArtifactRef, PreparedTab, display as viewer_display
 
 logger = logging.getLogger(__name__)
@@ -69,6 +72,103 @@ _FETCH_CONCURRENCY = 8
 _VIEWER_FETCH_CAP_CHARS = 2_000_000
 
 
+def _build_backend(*, config_path: str, bus_url: str) -> ArtifactBackend:
+    """Construct the artifact backend from YAML config.
+
+    Reads ``[artifacts] backend`` (``"bus"`` or ``"local"``) and,
+    for the local backend, ``[artifacts] db_path`` (relative paths
+    resolve against the config file's directory). Defaults to the
+    bus-backed read-only proxy so existing deployments keep
+    working without a config change.
+
+    The selection lives here rather than in ``__init__`` so tests
+    can call :meth:`StoreAgent.set_backend` without touching disk
+    and so the agent process surfaces a clear log line about
+    which backend is in use at startup.
+    """
+    cfg = _read_artifacts_config(config_path)
+    backend_value = _str_or_none(cfg, "backend", config_path)
+    backend_kind = (backend_value or "bus").strip().lower()
+    if backend_kind == "local":
+        db_path_value = _str_or_none(cfg, "db_path", config_path)
+        db_path = _resolve_db_path(db_path_value, config_path)
+        logger.info("store backend: local (db_path=%s)", db_path)
+        return LocalArtifactStore(db_path)
+    if backend_kind != "bus":
+        logger.warning(
+            "unknown artifacts.backend=%r in %s — falling back to 'bus'",
+            backend_kind, config_path,
+        )
+    logger.info("store backend: bus (bus_url=%s)", bus_url)
+    return BusBackedArtifactStore(bus_url)
+
+
+def _str_or_none(cfg: dict[str, Any], key: str, config_path: str) -> Optional[str]:
+    """Return the YAML-decoded ``cfg[key]`` if it's a string, else None.
+
+    YAML can decode ``backend: 1`` as an int and ``backend: ~`` as
+    None; the previous code went straight to ``.strip().lower()``
+    on the result and crashed at startup on either. Now we
+    log-and-default on any non-string so the agent boots
+    successfully and the operator sees the typo in the log.
+    """
+    value = cfg.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    logger.warning(
+        "invalid artifacts.%s=%r in %s — expected string; using default",
+        key, value, config_path,
+    )
+    return None
+
+
+def _read_artifacts_config(config_path: str) -> dict[str, Any]:
+    """Return the ``artifacts`` mapping from the YAML config, or {}.
+
+    Missing file or missing ``artifacts`` section both yield an
+    empty dict so the default backend kicks in. Config errors are
+    logged at WARNING and treated as "use defaults" — the agent
+    starting up successfully is more valuable than a hard crash on
+    a typo.
+    """
+    if not config_path:
+        return {}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, yaml.YAMLError) as exc:
+        logger.warning(
+            "could not read store config %s: %s — using defaults",
+            config_path, exc,
+        )
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    artifacts = data.get("artifacts")
+    return artifacts if isinstance(artifacts, dict) else {}
+
+
+def _resolve_db_path(db_path: Optional[str], config_path: str) -> str:
+    """Pick a sensible default if ``db_path`` is unset.
+
+    Default: ``store_artifacts.db`` next to the config file (or
+    cwd if no config). Relative paths in the config resolve
+    against the config dir so the agent works the same when
+    started from a different working directory.
+    """
+    if db_path:
+        if os.path.isabs(db_path):
+            return db_path
+        base = os.path.dirname(os.path.abspath(config_path)) if config_path else os.getcwd()
+        return os.path.join(base, db_path)
+    base = os.path.dirname(os.path.abspath(config_path)) if config_path else os.getcwd()
+    return os.path.join(base, "store_artifacts.db")
+
+
 class StoreAgent(BaseAgent):
     """Bus-native store agent.
 
@@ -86,7 +186,10 @@ class StoreAgent(BaseAgent):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self._backend: ArtifactBackend = BusBackedArtifactStore(self.bus_url)
+        self._backend: ArtifactBackend = _build_backend(
+            config_path=self.config_path,
+            bus_url=self.bus_url,
+        )
 
     def set_backend(self, backend: ArtifactBackend) -> ArtifactBackend:
         """Override the backend (tests + future Phase-4 swap).
@@ -203,6 +306,41 @@ class StoreAgent(BaseAgent):
                     "max_chars": {"type": "integer", "default": 4000},
                 },
                 since="0.4.0",
+            ),
+            Skill(
+                "artifact_create",
+                "Persist a new artifact in the store. Returns the "
+                "new artifact's metadata (id, sha256, size_bytes, "
+                "created_at, …) on success or {error: ...} on "
+                "validation failure (missing kind/title, oversized "
+                "content, duplicate id). Only works against a "
+                "write-capable backend — the default bus-backed "
+                "backend is read-only and rejects with a clear "
+                "error envelope.",
+                {
+                    "kind": {"type": "string", "required": True},
+                    "title": {"type": "string", "required": True},
+                    "content": {"type": "string", "required": True},
+                    "producer": {"type": "string", "default": ""},
+                    "session_id": {"type": "string", "default": ""},
+                    "trace_id": {"type": "string", "default": ""},
+                    "content_type": {
+                        "type": "string", "default": "text/plain",
+                    },
+                    "metadata": {"type": "object", "default": {}},
+                    "source_artifacts": {
+                        "type": "array", "default": [],
+                    },
+                    "id": {
+                        "type": "string", "default": "",
+                        "description": (
+                            "Optional caller-supplied id; "
+                            "auto-generated when empty."
+                        ),
+                    },
+                    "ttl": {"type": "string", "default": ""},
+                },
+                since="0.5.0",
             ),
             Skill(
                 "display",
@@ -351,6 +489,50 @@ class StoreAgent(BaseAgent):
         return await self._backend.excerpt(
             artifact_id, start_line=start, end_line=end, max_chars=max_chars,
         )
+
+    # -- artifact write skill ---------------------------------------------
+
+    @handler("artifact_create")
+    async def handle_artifact_create(self, args: dict[str, Any]) -> dict[str, Any]:
+        kind = str(args.get("kind") or "").strip()
+        if not kind:
+            return {"error": "kind is required"}
+        title = str(args.get("title") or "").strip()
+        if not title:
+            return {"error": "title is required"}
+        content = args.get("content")
+        if not isinstance(content, str):
+            return {"error": "content must be a string"}
+        # ``key in args`` rather than ``args.get(...) or default`` so a
+        # caller-supplied falsey-but-invalid value (e.g.
+        # ``metadata: []`` or ``source_artifacts: 0``) still trips the
+        # isinstance check below instead of being silently coerced
+        # to the default and waved through.
+        metadata = args["metadata"] if "metadata" in args else {}
+        if not isinstance(metadata, dict):
+            return {"error": "metadata must be an object"}
+        sources = args["source_artifacts"] if "source_artifacts" in args else []
+        if not isinstance(sources, list):
+            return {"error": "source_artifacts must be an array"}
+        # ``id`` overlaps with the bus's wire field name; "" → auto.
+        artifact_id = str(args.get("id") or "").strip()
+        ttl = str(args.get("ttl") or "").strip() or None
+        try:
+            return await self._backend.create(
+                kind=kind,
+                title=title,
+                content=content,
+                producer=str(args.get("producer") or ""),
+                session_id=str(args.get("session_id") or ""),
+                trace_id=str(args.get("trace_id") or ""),
+                content_type=str(args.get("content_type") or "text/plain"),
+                metadata=metadata,
+                source_artifacts=[str(s) for s in sources],
+                artifact_id=artifact_id,
+                ttl=ttl,
+            )
+        except NotImplementedError as exc:
+            return {"error": str(exc)}
 
     # -- display ----------------------------------------------------------
 

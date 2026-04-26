@@ -4,17 +4,18 @@ Bus-native store agent. Target eventual owner of the artifact backend
 (currently served by the bus's `bus_artifact_*` MCP surface) and host
 of a browser-based viewer mode for rendered artifacts.
 
-## Status — Phase 2 reads + Phase 3 viewer landed; write-ownership migration follows
+## Status — Phase 4a writes + Phase 2 reads + Phase 3 viewer landed; bus deprecation follows
 
 Registered bus agent. Skill surface today:
 
 - **Read API** — `artifact_list`, `artifact_metadata`,
   `artifact_get`, `artifact_head`, `artifact_tail`,
   `artifact_grep`, `artifact_excerpt`. All seven route through
-  an `ArtifactBackend` abstraction. The shipped backend is
-  `BusBackedArtifactStore`, an HTTP client against the bus's
-  REST routes (where data still lives). Phase 4 swaps in a
-  local SQLite backend without changing the skill surface.
+  an `ArtifactBackend` abstraction.
+- **Write API** — `artifact_create(kind, title, content, ...)`
+  — persists a new artifact via the configured backend. Returns
+  the new artifact's metadata (id, sha256, size_bytes, …) on
+  success or `{error: ...}` on validation failure.
 - **`display(artifacts, layout='tabs')`** — lazy in-process HTTP
   viewer that pre-fetches via the same `ArtifactBackend`
   (in-process call, no bus round-trip), and returns a browser
@@ -23,20 +24,31 @@ Registered bus agent. Skill surface today:
   base64-data `<img>`), prism.js code highlighting, and a `<pre>`
   fallback. Extensible via `@register_renderer("type/x")`.
 
-Tracked under `fr_store_08c1c6b2` (reads) and `fr_store_d22556bb`
-(viewer). Phase-1 scaffold under `fr_store_4ea7d48b` is complete.
+Backends are config-driven via `[artifacts] backend: bus | local`
+(see `config.example.yaml`). The default `bus` keeps Phase-2
+behavior — proxy reads to the bus's REST surface, reject writes
+with a clear error envelope. Switch to `local` to use the new
+SQLite-backed `LocalArtifactStore`; writes persist locally and
+all reads come from the local DB.
+
+Tracked under `fr_store_73e5a6f4` (writes), `fr_store_08c1c6b2`
+(reads), `fr_store_d22556bb` (viewer). Phase-1 scaffold under
+`fr_store_4ea7d48b` is complete.
 
 ## Phase status
 
 - **Phase 1 — scaffold** ✅ shipped (PR #1).
-- **Phase 2 — artifact read skills** ✅ shipped. `ArtifactBackend`
-  ABC + `BusBackedArtifactStore` HTTP backend; viewer fetch path
-  goes through the same backend in-process.
+- **Phase 2 — artifact read skills** ✅ shipped (PR #3).
+  `ArtifactBackend` ABC + `BusBackedArtifactStore` HTTP backend;
+  viewer fetch path goes through the same backend in-process.
 - **Phase 3 — viewer mode** ✅ shipped (PR #2).
-- **Phase 4 — artifact write skills + migration**
-  (`stage_payload`, `replace`, `delete`) — _open_. Local SQLite
-  backend replaces `BusBackedArtifactStore`; bus's artifact REST
-  surface becomes a read-proxy or is removed.
+- **Phase 4a — local write surface** ✅ shipped.
+  `LocalArtifactStore` (SQLite) + `artifact_create`; backend
+  selection via config; default unchanged.
+- **Phase 4b** — `CompositeArtifactBackend(local, bus)` for
+  union reads + bus → local migration tooling. _Open._
+- **Phase 4c** — deprecate bus's `bus_artifact_*` HTTP routes
+  once 4b's migration has run. _Open._
 - **Phase 5 — researcher integration** — _open_. Wires
   `fr_researcher_000ad07c`'s `stage_payload` / `ingest_from_artifact`
   through the store once writes land.

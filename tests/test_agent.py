@@ -63,6 +63,14 @@ class FakeBackend(ArtifactBackend):
     async def excerpt(self, artifact_id: str, **kwargs: Any) -> dict[str, Any]:
         return self._record("excerpt", id=artifact_id, **kwargs)
 
+    async def create(self, **kwargs: Any) -> dict[str, Any]:
+        # Non-LocalArtifactStore backends raise from the ABC default;
+        # the FakeBackend opts in by overriding so tests can exercise
+        # the happy path without standing up SQLite. Tests that want
+        # to see the read-only rejection use the default
+        # BusBackedArtifactStore on the agent.
+        return self._record("create", **kwargs)
+
 
 @pytest.fixture
 def harness():
@@ -556,3 +564,143 @@ async def test_shutdown_swallows_backend_close_errors(harness, caplog):
     harness.agent.set_backend(RaiseOnClose())
     harness.agent._connector = None
     await harness.agent.shutdown()  # must not raise
+
+
+# -- artifact_create ----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_artifact_create_threads_kwargs(harness, backend):
+    backend.response = {"id": "art_xyz", "kind": "note"}
+    result = await harness.call("artifact_create", {
+        "kind": "note",
+        "title": "Hello",
+        "content": "Body",
+        "metadata": {"k": "v"},
+        "source_artifacts": ["art_a"],
+        "id": "",
+    })
+    assert result == {"id": "art_xyz", "kind": "note"}
+    op, kwargs = backend.calls[0]
+    assert op == "create"
+    assert kwargs["kind"] == "note"
+    assert kwargs["title"] == "Hello"
+    assert kwargs["content"] == "Body"
+    assert kwargs["metadata"] == {"k": "v"}
+    assert kwargs["source_artifacts"] == ["art_a"]
+    # Empty caller-supplied id maps to "" (auto-generate); LocalArtifactStore
+    # uses that signal to mint a fresh art_<hex> id.
+    assert kwargs["artifact_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_artifact_create_validates_required_fields(harness, backend):
+    cases = [
+        ({}, "kind is required"),
+        ({"kind": "note"}, "title is required"),
+        ({"kind": "note", "title": "t"}, "content must be a string"),
+        ({"kind": "note", "title": "t", "content": "x", "metadata": "not-an-object"}, "metadata must be an object"),
+        ({"kind": "note", "title": "t", "content": "x", "source_artifacts": "not-a-list"}, "source_artifacts must be an array"),
+        # Falsey-but-invalid types used to slip past
+        # ``args.get("metadata") or {}`` since the falsey value
+        # was coerced into the default before the type check.
+        ({"kind": "note", "title": "t", "content": "x", "metadata": []}, "metadata must be an object"),
+        ({"kind": "note", "title": "t", "content": "x", "source_artifacts": 0}, "source_artifacts must be an array"),
+    ]
+    for args, expected in cases:
+        result = await harness.call("artifact_create", args)
+        assert result == {"error": expected}, f"input={args!r}"
+    # None of these should have reached the backend.
+    assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_artifact_create_against_read_only_backend_returns_clear_error(harness):
+    """Default ``BusBackedArtifactStore`` is read-only; the
+    ABC's ``create`` raises ``NotImplementedError`` whose message
+    names the backend. The handler must surface that as a clean
+    error envelope rather than letting it propagate.
+    """
+    # No fixture here — keep the default BusBackedArtifactStore.
+    result = await harness.call("artifact_create", {
+        "kind": "note", "title": "t", "content": "c",
+    })
+    assert "error" in result
+    assert "BusBackedArtifactStore" in result["error"]
+    assert "read-only" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_advertises_artifact_create_skill(harness):
+    skill_names = {s["name"] for s in harness.registration.skills}
+    assert "artifact_create" in skill_names
+
+
+# -- backend selection from config -------------------------------------------
+
+
+def test_build_backend_defaults_to_bus(tmp_path):
+    """Missing config or missing ``artifacts`` section yields a
+    bus-backed backend so existing deployments keep working
+    without a config change after the upgrade.
+    """
+    from store.agent import _build_backend
+
+    # No config file at all.
+    backend = _build_backend(config_path="", bus_url="http://bus")
+    from store.artifacts import BusBackedArtifactStore
+    assert isinstance(backend, BusBackedArtifactStore)
+
+
+def test_build_backend_picks_local_when_configured(tmp_path):
+    from store.agent import _build_backend
+    from store.local_store import LocalArtifactStore
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("artifacts:\n  backend: local\n  db_path: store.db\n")
+    backend = _build_backend(config_path=str(cfg), bus_url="http://bus")
+    assert isinstance(backend, LocalArtifactStore)
+    # Relative db_path resolves against config's directory so the
+    # agent picks up the same DB regardless of cwd.
+    assert backend._db_path == str(tmp_path / "store.db")
+
+
+def test_build_backend_unknown_backend_falls_back_to_bus(tmp_path):
+    """An unrecognized ``artifacts.backend`` value (typo, future
+    backend kind, etc.) shouldn't take down agent startup —
+    log a warning and use the safe default.
+    """
+    from store.agent import _build_backend
+    from store.artifacts import BusBackedArtifactStore
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("artifacts:\n  backend: hypothetical\n")
+    backend = _build_backend(config_path=str(cfg), bus_url="http://bus")
+    assert isinstance(backend, BusBackedArtifactStore)
+
+
+def test_build_backend_handles_non_string_config_values(tmp_path):
+    """YAML happily decodes ``backend: 1`` as an int and
+    ``db_path: ~`` as None. The previous code went straight to
+    ``.strip().lower()`` on those and crashed at startup; now
+    they're rejected at the config-load layer with a warning so
+    the agent boots safely.
+    """
+    from store.agent import _build_backend
+    from store.artifacts import BusBackedArtifactStore
+    from store.local_store import LocalArtifactStore
+
+    # Non-string backend value → fallback to bus.
+    bad_backend = tmp_path / "bad-backend.yaml"
+    bad_backend.write_text("artifacts:\n  backend: 1\n")
+    backend = _build_backend(config_path=str(bad_backend), bus_url="http://bus")
+    assert isinstance(backend, BusBackedArtifactStore)
+
+    # Non-string db_path with backend=local → still picks
+    # LocalArtifactStore but with the resolved default db path
+    # (next to the config), not the malformed value.
+    bad_db_path = tmp_path / "bad-db-path.yaml"
+    bad_db_path.write_text("artifacts:\n  backend: local\n  db_path: []\n")
+    backend2 = _build_backend(config_path=str(bad_db_path), bus_url="http://bus")
+    assert isinstance(backend2, LocalArtifactStore)
+    assert backend2._db_path == str(tmp_path / "store_artifacts.db")
