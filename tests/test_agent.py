@@ -704,3 +704,652 @@ def test_build_backend_handles_non_string_config_values(tmp_path):
     backend2 = _build_backend(config_path=str(bad_db_path), bus_url="http://bus")
     assert isinstance(backend2, LocalArtifactStore)
     assert backend2._db_path == str(tmp_path / "store_artifacts.db")
+
+
+# -- composite backend wiring ------------------------------------------------
+
+
+def test_build_backend_composite_pairs_local_and_bus(tmp_path):
+    """``backend: composite`` should construct a
+    :class:`CompositeArtifactBackend` whose halves are a
+    :class:`LocalArtifactStore` (for writes + local-first reads)
+    and a :class:`BusBackedArtifactStore` (for read fallback).
+    """
+    from store.agent import _build_backend
+    from store.composite import CompositeArtifactBackend
+    from store.artifacts import BusBackedArtifactStore
+    from store.local_store import LocalArtifactStore
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("artifacts:\n  backend: composite\n")
+    backend = _build_backend(config_path=str(cfg), bus_url="http://bus")
+    assert isinstance(backend, CompositeArtifactBackend)
+    # Use the public accessors rather than reaching into
+    # ``_local`` / ``_fallback`` — the public surface is the
+    # API we promise to migration tooling.
+    assert isinstance(backend.local, LocalArtifactStore)
+    assert isinstance(backend.fallback, BusBackedArtifactStore)
+
+
+# -- artifact_migrate_from_bus -----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_migrate_requires_local_target(harness, backend):
+    """The default ``BusBackedArtifactStore`` (read-only) has
+    nowhere to copy *to*. The handler must surface that as a
+    clear error rather than silently doing nothing, AND keep
+    the standard response shape so callers see consistent
+    keys regardless of which path the run took.
+    """
+    # FakeBackend has no migration endpoints (not Local nor Composite).
+    result = await harness.call("artifact_migrate_from_bus", {})
+    assert "error" in result
+    # Error names the required backend kind + the detected
+    # type so operators see the exact mismatch.
+    assert "backend=composite" in result["error"]
+    assert "LocalArtifactStore" in result["error"]
+    # Standard response keys are present even on the
+    # misconfiguration path.
+    for key in ("copied", "skipped", "errors", "scanned", "dry_run"):
+        assert key in result, f"missing {key!r} in {result}"
+    assert result["copied"] == 0
+    assert result["scanned"] == 0
+
+
+@pytest.mark.asyncio
+async def test_migrate_requires_bus_fallback(harness, tmp_path):
+    """``backend=local`` (no fallback) is similarly stuck —
+    nothing to migrate from. Operator should switch to
+    ``backend=composite``. Response shape stays consistent.
+    """
+    from store.local_store import LocalArtifactStore
+
+    local = LocalArtifactStore(str(tmp_path / "local.db"))
+    previous = harness.agent.set_backend(local)
+    try:
+        result = await harness.call("artifact_migrate_from_bus", {})
+        assert "error" in result
+        assert "composite" in result["error"]
+        for key in ("copied", "skipped", "errors", "scanned", "dry_run"):
+            assert key in result
+    finally:
+        await local.close()
+        await previous.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_copies_artifacts_through_composite(harness, tmp_path):
+    """End-to-end happy path: composite backend with a fake
+    fallback that has two artifacts; artifact_migrate_from_bus
+    pages through the list, fetches each artifact's content, and
+    writes it to the local SQLite — all under the same id so
+    callers see the same identifier under both backends.
+    """
+    from store.local_store import LocalArtifactStore
+    from store.composite import CompositeArtifactBackend
+
+    local = LocalArtifactStore(str(tmp_path / "migration.db"))
+    fallback_state = {
+        "art_one": {"meta": {
+            "id": "art_one", "kind": "note", "title": "First",
+            "size_bytes": 5,
+        }, "content": "hello"},
+        "art_two": {"meta": {
+            "id": "art_two", "kind": "log", "title": "Second",
+            "size_bytes": 5,
+        }, "content": "world"},
+    }
+
+    class _Bus(ArtifactBackend):
+        async def list(self, **kw):
+            return [v["meta"] for v in fallback_state.values()]
+        async def metadata(self, aid):
+            v = fallback_state.get(aid)
+            return v["meta"] if v else {"error": "artifact not found"}
+        async def get(self, aid, **kw):
+            v = fallback_state.get(aid)
+            if not v:
+                return {"error": "artifact not found"}
+            return {"artifact": v["meta"], "text": v["content"], "truncated": False}
+        async def head(self, aid, **kw): return {"error": "artifact not found"}
+        async def tail(self, aid, **kw): return {"error": "artifact not found"}
+        async def grep(self, aid, **kw): return {"error": "artifact not found"}
+        async def excerpt(self, aid, **kw): return {"error": "artifact not found"}
+
+    composite = CompositeArtifactBackend(local=local, fallback=_Bus())
+    previous = harness.agent.set_backend(composite)
+    try:
+        result = await harness.call("artifact_migrate_from_bus", {})
+        assert result["copied"] == 2
+        assert result["skipped"] == 0
+        assert result["errors"] == []
+        assert result["scanned"] == 2
+
+        # Round-trip: post-migration metadata reads should hit
+        # local-side rows (no fallback round trip needed).
+        local_meta = await local.metadata("art_one")
+        assert local_meta["title"] == "First"
+        assert local_meta["id"] == "art_one"
+    finally:
+        await composite.close()
+        await previous.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_is_idempotent(harness, tmp_path):
+    """Re-running after a partial run must skip already-present
+    ids rather than erroring on every duplicate-id INSERT. The
+    skip count surfaces the resumption signal so operators see
+    the run made progress.
+    """
+    from store.local_store import LocalArtifactStore
+    from store.composite import CompositeArtifactBackend
+
+    local = LocalArtifactStore(str(tmp_path / "idempotent.db"))
+    state = {
+        "art_x": {"meta": {"id": "art_x", "kind": "note", "title": "X"}, "content": "x"},
+    }
+
+    class _Bus(ArtifactBackend):
+        async def list(self, **kw): return [v["meta"] for v in state.values()]
+        async def metadata(self, aid): return state[aid]["meta"]
+        async def get(self, aid, **kw):
+            return {"artifact": state[aid]["meta"], "text": state[aid]["content"]}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    composite = CompositeArtifactBackend(local=local, fallback=_Bus())
+    previous = harness.agent.set_backend(composite)
+    try:
+        first = await harness.call("artifact_migrate_from_bus", {})
+        assert first["copied"] == 1 and first["skipped"] == 0
+
+        # Re-run: every artifact is already present locally → all skipped.
+        second = await harness.call("artifact_migrate_from_bus", {})
+        assert second["copied"] == 0
+        assert second["skipped"] == 1
+        assert second["errors"] == []
+    finally:
+        await composite.close()
+        await previous.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_dry_run_logs_without_writing(harness, tmp_path):
+    """``dry_run=True`` exercises the same fetch path but never
+    calls ``LocalArtifactStore.create``. The local DB stays
+    empty; the report shows ``copied=N`` so the operator can
+    confirm what a real run would do.
+    """
+    from store.local_store import LocalArtifactStore
+    from store.composite import CompositeArtifactBackend
+
+    local = LocalArtifactStore(str(tmp_path / "dry.db"))
+    state = {
+        "art_y": {"meta": {"id": "art_y", "kind": "note", "title": "Y"}, "content": "y"},
+    }
+
+    class _Bus(ArtifactBackend):
+        async def list(self, **kw): return [v["meta"] for v in state.values()]
+        async def metadata(self, aid): return state[aid]["meta"]
+        async def get(self, aid, **kw):
+            return {"artifact": state[aid]["meta"], "text": state[aid]["content"]}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    composite = CompositeArtifactBackend(local=local, fallback=_Bus())
+    previous = harness.agent.set_backend(composite)
+    try:
+        result = await harness.call("artifact_migrate_from_bus", {"dry_run": True})
+        assert result["copied"] == 1
+        assert result["dry_run"] is True
+        # Local DB stays empty — nothing actually written.
+        local_meta = await local.metadata("art_y")
+        assert local_meta == {"error": "artifact not found"}
+    finally:
+        await composite.close()
+        await previous.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_skill_advertised(harness):
+    skill_names = {s["name"] for s in harness.registration.skills}
+    assert "artifact_migrate_from_bus" in skill_names
+
+
+@pytest.mark.asyncio
+async def test_migrate_with_zero_limit_validates_then_no_ops(harness, backend):
+    """``limit=0`` is a "config + plumbing wired?" smoke test —
+    so a misconfigured backend (read-only, no fallback) must
+    still produce the misconfiguration error. Without the
+    validation-before-short-circuit ordering, ``limit=0`` would
+    return a false-positive success envelope.
+    """
+    # FakeBackend isn't a Local or Composite, so endpoints check fails.
+    result = await harness.call("artifact_migrate_from_bus", {"limit": 0})
+    assert "error" in result
+    assert "backend=composite" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_migrate_with_zero_limit_is_noop(harness, tmp_path):
+    """``limit=0`` is a "doesn't actually migrate, just confirm
+    config" smoke test. With endpoints valid the handler
+    returns the standard response shape with zero counts and
+    never round-trips the fallback.
+    """
+    from store.local_store import LocalArtifactStore
+    from store.composite import CompositeArtifactBackend
+
+    list_calls: list = []
+
+    class _Bus(ArtifactBackend):
+        async def list(self, **kw):
+            list_calls.append(kw)
+            return [{"id": "art_a", "kind": "note", "title": "A"}]
+        async def metadata(self, aid): return {"id": aid}
+        async def get(self, aid, **kw): return {"text": "x"}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    local = LocalArtifactStore(str(tmp_path / "noop.db"))
+    composite = CompositeArtifactBackend(local=local, fallback=_Bus())
+    previous = harness.agent.set_backend(composite)
+    try:
+        result = await harness.call("artifact_migrate_from_bus", {"limit": 0})
+        assert result == {
+            "copied": 0, "skipped": 0,
+            "errors": [], "scanned": 0,
+            "dry_run": False,
+        }
+        # Bus list() must NOT have been called — the no-op
+        # short-circuit is what makes it a useful smoke test.
+        assert list_calls == []
+    finally:
+        await composite.close()
+        await previous.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_strips_whitespace_kind_and_title(harness, tmp_path):
+    """Migration must reject whitespace-only ``kind``/``title``
+    the same way ``handle_artifact_create`` does. Without the
+    strip-then-validate, a ``"   "`` title from the bus side
+    would have been persisted locally as a whitespace-only
+    artifact name.
+    """
+    from store.local_store import LocalArtifactStore
+    from store.composite import CompositeArtifactBackend
+
+    local = LocalArtifactStore(str(tmp_path / "ws.db"))
+    state = {
+        "art_ws": {
+            "meta": {"id": "art_ws", "kind": "  ", "title": "  "},
+            "content": "x",
+        },
+    }
+
+    class _Bus(ArtifactBackend):
+        async def list(self, **kw): return [v["meta"] for v in state.values()]
+        async def metadata(self, aid): return state[aid]["meta"]
+        async def get(self, aid, **kw):
+            return {"artifact": state[aid]["meta"], "text": state[aid]["content"]}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    composite = CompositeArtifactBackend(local=local, fallback=_Bus())
+    previous = harness.agent.set_backend(composite)
+    try:
+        result = await harness.call("artifact_migrate_from_bus", {})
+        assert result["copied"] == 0
+        assert len(result["errors"]) == 1
+        assert "kind is required" in result["errors"][0]["error"]
+        # And the local DB stayed empty.
+        meta = await local.metadata("art_ws")
+        assert meta == {"error": "artifact not found"}
+    finally:
+        await composite.close()
+        await previous.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_rejects_miswired_composite(harness, tmp_path):
+    """A composite wired with non-default backends (e.g. a
+    custom local that ISN'T LocalArtifactStore) shouldn't be
+    accepted for migration — the duplicate-detection path
+    relies on the local-store-specific error envelope, and
+    fetches need the actual bus client. Surface as a
+    misconfiguration so the operator wires it correctly.
+    """
+    from store.composite import CompositeArtifactBackend
+
+    class _CustomLocal(ArtifactBackend):
+        async def list(self, **kw): return []
+        async def metadata(self, aid): return {"error": "artifact not found"}
+        async def get(self, aid, **kw): return {"error": "artifact not found"}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+        async def create(self, **kw): return {"id": "synthetic"}
+
+    class _CustomFallback(ArtifactBackend):
+        async def list(self, **kw): return []
+        async def metadata(self, aid): return {"error": "artifact not found"}
+        async def get(self, aid, **kw): return {"error": "artifact not found"}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    composite = CompositeArtifactBackend(
+        local=_CustomLocal(), fallback=_CustomFallback(),
+    )
+    previous = harness.agent.set_backend(composite)
+    try:
+        result = await harness.call("artifact_migrate_from_bus", {})
+        assert "error" in result
+        # _migration_endpoints rejected the miswired composite at
+        # the "no local target" check; the new error message
+        # names the required backend shape and the detected type.
+        assert "LocalArtifactStore" in result["error"]
+        assert "CompositeArtifactBackend" in result["error"]
+    finally:
+        await composite.close()
+        await previous.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_one_swallows_not_implemented_error_from_target():
+    """Direct unit test for the defense-in-depth guard in
+    ``_migrate_one``: a target whose ``create()`` raises
+    ``NotImplementedError`` must surface as a per-artifact error
+    rather than aborting the caller. Through the public API
+    this path is unreachable now that ``_migration_endpoints``
+    rejects miswired composites, but the guard remains in
+    place for any future internal call site that bypasses the
+    endpoint validation.
+    """
+    from store.agent import _migrate_one
+
+    class _ReadOnlyTarget(ArtifactBackend):
+        async def list(self, **kw): return []
+        async def metadata(self, aid): return {"error": "artifact not found"}
+        async def get(self, aid, **kw): return {"error": "artifact not found"}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+        # Inherits the ABC's NotImplementedError default for create()
+
+    class _Source(ArtifactBackend):
+        async def list(self, **kw): return []
+        async def metadata(self, aid): return {"id": aid}
+        async def get(self, aid, **kw):
+            return {"artifact": {"id": aid}, "text": "x"}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    outcome = await _migrate_one(
+        aid="art_x",
+        meta={"id": "art_x", "kind": "note", "title": "X"},
+        source=_Source(),
+        target=_ReadOnlyTarget(),
+        dry_run=False,
+    )
+    assert outcome.startswith("create failed:")
+    assert "read-only" in outcome
+
+
+@pytest.mark.asyncio
+async def test_migrate_dry_run_reports_skipped_when_already_local(harness, tmp_path):
+    """``dry_run`` must mirror the real run's outcome counts:
+    when an id is already present locally, both modes should
+    report ``skipped``. Previously dry-run reported ``copied``
+    even for ids that would skip on a real run.
+    """
+    from store.local_store import LocalArtifactStore
+    from store.composite import CompositeArtifactBackend
+
+    local = LocalArtifactStore(str(tmp_path / "dry-skip.db"))
+    # Pre-populate locally so the migration would skip.
+    await local.create(kind="note", title="X", content="x", artifact_id="art_x")
+
+    state = {
+        "art_x": {"meta": {"id": "art_x", "kind": "note", "title": "X"}, "content": "x"},
+    }
+
+    class _Bus(ArtifactBackend):
+        async def list(self, **kw): return [v["meta"] for v in state.values()]
+        async def metadata(self, aid): return state[aid]["meta"]
+        async def get(self, aid, **kw):
+            return {"artifact": state[aid]["meta"], "text": state[aid]["content"]}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    composite = CompositeArtifactBackend(local=local, fallback=_Bus())
+    previous = harness.agent.set_backend(composite)
+    try:
+        result = await harness.call("artifact_migrate_from_bus", {"dry_run": True})
+        assert result["copied"] == 0
+        assert result["skipped"] == 1
+    finally:
+        await composite.close()
+        await previous.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_records_truncation_as_error(harness, tmp_path):
+    """If the source-side fetch came back truncated, the
+    migration must NOT silently write partial content. The
+    artifact ends up in ``errors`` instead of ``copied``.
+    """
+    from store.local_store import LocalArtifactStore
+    from store.composite import CompositeArtifactBackend
+
+    local = LocalArtifactStore(str(tmp_path / "truncated.db"))
+
+    class _Bus(ArtifactBackend):
+        async def list(self, **kw):
+            return [{"id": "art_big", "kind": "note", "title": "Big"}]
+        async def metadata(self, aid):
+            return {"id": "art_big", "kind": "note", "title": "Big"}
+        async def get(self, aid, **kw):
+            return {
+                "artifact": {"id": "art_big"},
+                "text": "partial-only",
+                "truncated": True,
+            }
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    composite = CompositeArtifactBackend(local=local, fallback=_Bus())
+    previous = harness.agent.set_backend(composite)
+    try:
+        result = await harness.call("artifact_migrate_from_bus", {})
+        assert result["copied"] == 0
+        assert result["skipped"] == 0
+        assert len(result["errors"]) == 1
+        assert result["errors"][0]["error"] == "fetch truncated"
+        # And the local DB should NOT have the partial row.
+        meta = await local.metadata("art_big")
+        assert meta == {"error": "artifact not found"}
+    finally:
+        await composite.close()
+        await previous.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_one_surfaces_unexpected_local_metadata_error():
+    """Direct unit test for the local-side metadata-failure
+    path in ``_migrate_one``: when the local store returns an
+    error other than ``"artifact not found"`` (e.g. ``"local
+    store error"`` from a sqlite failure), migration must
+    surface that as a per-artifact error rather than treating
+    it as "not present" and proceeding to fetch + create.
+
+    Through the public API the new ``_migration_endpoints``
+    type check now requires a real ``LocalArtifactStore`` for
+    the local half, so this scenario is unreachable end-to-end
+    — but the in-function guard remains as defense-in-depth
+    for any future internal call site that bypasses the
+    endpoint validation.
+    """
+    from store.agent import _migrate_one
+
+    class _SickLocal(ArtifactBackend):
+        async def metadata(self, aid):
+            return {"error": "local store error"}
+        async def list(self, **kw): return []
+        async def get(self, aid, **kw): return {"error": "local store error"}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+        async def create(self, **kw):
+            raise AssertionError(
+                "create should not be reached when local metadata is sick"
+            )
+
+    class _Source(ArtifactBackend):
+        async def list(self, **kw): return []
+        async def metadata(self, aid): return {"id": aid}
+        async def get(self, aid, **kw):
+            return {"artifact": {"id": aid}, "text": "x"}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    outcome = await _migrate_one(
+        aid="art_x",
+        meta={"id": "art_x", "kind": "note", "title": "X"},
+        source=_Source(),
+        target=_SickLocal(),
+        dry_run=False,
+    )
+    assert outcome.startswith("metadata failed:")
+    assert "local store error" in outcome
+
+
+@pytest.mark.asyncio
+async def test_migrate_dry_run_accepts_string_booleans(harness, tmp_path):
+    """``dry_run="false"`` used to slip past ``bool(value)`` and
+    become ``True`` (any non-empty string is truthy in Python).
+    The strict ``_bool_arg`` helper now treats common string
+    forms (``"true"`` / ``"false"`` / ``"1"`` / ``"0"``) the
+    way a human would expect.
+    """
+    from store.local_store import LocalArtifactStore
+    from store.composite import CompositeArtifactBackend
+
+    local = LocalArtifactStore(str(tmp_path / "string-bool.db"))
+    state = {
+        "art_a": {"meta": {"id": "art_a", "kind": "note", "title": "A"}, "content": "a"},
+    }
+
+    class _Bus(ArtifactBackend):
+        async def list(self, **kw): return [v["meta"] for v in state.values()]
+        async def metadata(self, aid): return state[aid]["meta"]
+        async def get(self, aid, **kw):
+            return {"artifact": state[aid]["meta"], "text": state[aid]["content"]}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    composite = CompositeArtifactBackend(local=local, fallback=_Bus())
+    previous = harness.agent.set_backend(composite)
+    try:
+        # "false" → real run, not dry-run; the artifact actually
+        # gets written.
+        result = await harness.call(
+            "artifact_migrate_from_bus", {"dry_run": "false"}
+        )
+        assert result["dry_run"] is False
+        assert result["copied"] == 1
+        # Local DB now has the row — proving the run wasn't
+        # silently treated as dry.
+        meta = await local.metadata("art_a")
+        assert meta["title"] == "A"
+    finally:
+        await composite.close()
+        await previous.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_dry_run_rejects_garbage_strings(harness, tmp_path):
+    """Bogus values like ``dry_run="maybe"`` should fail loudly
+    rather than be silently coerced.
+    """
+    from store.local_store import LocalArtifactStore
+    from store.composite import CompositeArtifactBackend
+
+    local = LocalArtifactStore(str(tmp_path / "bogus-bool.db"))
+
+    class _Bus(ArtifactBackend):
+        async def list(self, **kw): return []
+        async def metadata(self, aid): return {"error": "artifact not found"}
+        async def get(self, aid, **kw): return {"error": "artifact not found"}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    composite = CompositeArtifactBackend(local=local, fallback=_Bus())
+    previous = harness.agent.set_backend(composite)
+    try:
+        result = await harness.call(
+            "artifact_migrate_from_bus", {"dry_run": "maybe"}
+        )
+        assert result == {"error": "dry_run must be a boolean"}
+    finally:
+        await composite.close()
+        await previous.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_bus_list_failure_includes_dry_run(harness, tmp_path):
+    """The skill contract advertises ``dry_run`` on every
+    response shape; the bus-list-failure path must include it
+    too so callers can rely on consistent keys.
+    """
+    from store.local_store import LocalArtifactStore
+    from store.composite import CompositeArtifactBackend
+
+    local = LocalArtifactStore(str(tmp_path / "list-fail.db"))
+
+    class _Bus(ArtifactBackend):
+        async def list(self, **kw): return {"error": "bus unreachable"}
+        async def metadata(self, aid): return {"error": "artifact not found"}
+        async def get(self, aid, **kw): return {"error": "artifact not found"}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    composite = CompositeArtifactBackend(local=local, fallback=_Bus())
+    previous = harness.agent.set_backend(composite)
+    try:
+        result = await harness.call("artifact_migrate_from_bus", {"dry_run": True})
+        assert "error" in result
+        assert "dry_run" in result
+        assert result["dry_run"] is True
+    finally:
+        await composite.close()
+        await previous.close()

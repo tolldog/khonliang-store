@@ -49,7 +49,8 @@ import yaml
 from khonliang_bus import BaseAgent, Skill, handler
 
 from store.artifacts import ArtifactBackend, BusBackedArtifactStore
-from store.local_store import LocalArtifactStore
+from store.composite import CompositeArtifactBackend
+from store.local_store import HARD_MAX_CHARS, LocalArtifactStore, MAX_LIST_LIMIT
 from store.viewer import ArtifactRef, PreparedTab, display as viewer_display
 
 logger = logging.getLogger(__name__)
@@ -75,11 +76,12 @@ _VIEWER_FETCH_CAP_CHARS = 2_000_000
 def _build_backend(*, config_path: str, bus_url: str) -> ArtifactBackend:
     """Construct the artifact backend from YAML config.
 
-    Reads ``[artifacts] backend`` (``"bus"`` or ``"local"``) and,
-    for the local backend, ``[artifacts] db_path`` (relative paths
-    resolve against the config file's directory). Defaults to the
-    bus-backed read-only proxy so existing deployments keep
-    working without a config change.
+    Reads ``[artifacts] backend`` (one of ``bus``, ``local``,
+    ``composite``) and — for the local + composite backends —
+    ``[artifacts] db_path`` (relative paths resolve against the
+    config file's directory). Defaults to the bus-backed
+    read-only proxy so existing deployments keep working
+    without a config change.
 
     The selection lives here rather than in ``__init__`` so tests
     can call :meth:`StoreAgent.set_backend` without touching disk
@@ -94,6 +96,17 @@ def _build_backend(*, config_path: str, bus_url: str) -> ArtifactBackend:
         db_path = _resolve_db_path(db_path_value, config_path)
         logger.info("store backend: local (db_path=%s)", db_path)
         return LocalArtifactStore(db_path)
+    if backend_kind == "composite":
+        db_path_value = _str_or_none(cfg, "db_path", config_path)
+        db_path = _resolve_db_path(db_path_value, config_path)
+        logger.info(
+            "store backend: composite (local db_path=%s, fallback bus_url=%s)",
+            db_path, bus_url,
+        )
+        return CompositeArtifactBackend(
+            local=LocalArtifactStore(db_path),
+            fallback=BusBackedArtifactStore(bus_url),
+        )
     if backend_kind != "bus":
         logger.warning(
             "unknown artifacts.backend=%r in %s — falling back to 'bus'",
@@ -343,6 +356,37 @@ class StoreAgent(BaseAgent):
                 since="0.5.0",
             ),
             Skill(
+                "artifact_migrate_from_bus",
+                "Copy artifacts from the bus's REST surface into "
+                "the local SQLite store, preserving artifact ids "
+                "so callers see the same id under both backends. "
+                "Returns {copied, skipped, errors, scanned, "
+                "dry_run}, plus an 'error' key if the bus list "
+                "request itself fails. Idempotent: ids already "
+                "present locally count as 'skipped'. Requires "
+                "backend=composite with a LocalArtifactStore "
+                "write target. The fallback (read source) is any "
+                "ArtifactBackend that implements the ABC; "
+                "production wires BusBackedArtifactStore. The "
+                "bus list endpoint does not "
+                "expose a paging cursor today, so this skill "
+                "migrates at most 'limit' artifacts (capped at "
+                "100) per call. Larger corpora are gated on the "
+                "bus-side cursor work (Phase 4c follow-up). "
+                "dry_run logs what would happen without writing.",
+                {
+                    "limit": {
+                        "type": "integer", "default": 100,
+                        "description": (
+                            "Page size for the bus list call; "
+                            "capped at 100 by the bus."
+                        ),
+                    },
+                    "dry_run": {"type": "boolean", "default": False},
+                },
+                since="0.6.0",
+            ),
+            Skill(
                 "display",
                 "Open (or reuse) the in-process viewer and register "
                 "the supplied artifacts as tabs. Returns the viewer URL "
@@ -534,6 +578,178 @@ class StoreAgent(BaseAgent):
         except NotImplementedError as exc:
             return {"error": str(exc)}
 
+    # -- artifact migration ----------------------------------------------
+
+    @handler("artifact_migrate_from_bus")
+    async def handle_artifact_migrate_from_bus(
+        self, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Copy bus-resident artifacts into the local SQLite store.
+
+        Reads the bus's ``/v1/artifacts`` paginated list via a
+        :class:`BusBackedArtifactStore` (the existing bus REST
+        surface), pulls each artifact's content with
+        ``backend.get(id, max_chars=large)``, then calls
+        ``LocalArtifactStore.create(artifact_id=...)`` so ids are
+        preserved. Idempotent: a duplicate-id INSERT raises
+        :class:`sqlite3.IntegrityError`, which the local backend
+        translates into an error envelope of the form
+        ``{"error": "duplicate artifact id: <sqlite message>"}``;
+        ``_migrate_one`` recognizes the prefix and counts those
+        responses as ``skipped``.
+
+        Single-page migration. The bus's list endpoint takes no
+        cursor, so this skill processes only the first ``limit``
+        rows (capped at the bus's ``MAX_LIST_LIMIT=100``) per
+        call. Real cursor support is a Phase 4c follow-up; until
+        then operators with corpora larger than 100 artifacts
+        re-run after each call's rows have been migrated and
+        will appear in subsequent ``list()`` results from
+        further down the queue (this assumes deletion / TTL
+        eviction surfaces older rows; otherwise migration of
+        the long tail is gated on the bus-side cursor work).
+
+        Requires the agent to have a write-capable local
+        backend AND a bus fallback — i.e. ``backend=composite``.
+        """
+        try:
+            limit = _int_arg(args, "limit", 100)
+            dry_run = _bool_arg(args, "dry_run", False)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        # Cap at MAX_LIST_LIMIT (the bus's REST clamp; the
+        # local store enforces the same value) — asking for
+        # more wastes a round trip. Allow 0 as an explicit
+        # no-op (e.g. a connectivity / configuration smoke
+        # test that returns the standard response shape with
+        # zero counts).
+        if limit < 0:
+            limit = 0
+        if limit > MAX_LIST_LIMIT:
+            limit = MAX_LIST_LIMIT
+
+        # Validate endpoints BEFORE the ``limit==0`` no-op
+        # short-circuit so a misconfigured backend doesn't get a
+        # false-positive "all good" response. ``limit=0`` is meant
+        # to be a "config + plumbing wired correctly?" smoke test;
+        # silently reporting success when the backend has nothing
+        # to migrate to/from would defeat that.
+        local_target, fallback_source = _migration_endpoints(self._backend)
+        if local_target is None:
+            # Maintain the standard response shape on
+            # misconfiguration paths so callers can rely on
+            # consistent keys regardless of whether the run
+            # succeeded, partially failed, or never started.
+            # Name the detected backend type so operators see
+            # the exact mismatch — a composite wired with a
+            # custom local half is functionally distinct from a
+            # plain bus backend, and "read-only" alone hid that.
+            backend_type = type(self._backend).__name__
+            return {
+                "copied": 0, "skipped": 0,
+                "errors": [], "scanned": 0,
+                "dry_run": dry_run,
+                "error": (
+                    "artifact_migrate_from_bus requires "
+                    "backend=composite with a LocalArtifactStore "
+                    f"local half; current backend is {backend_type}"
+                ),
+            }
+        if fallback_source is None:
+            # Operator wants to migrate but didn't wire a fallback —
+            # nothing to copy from. Surface the misconfiguration
+            # explicitly rather than silently reporting 0 copied.
+            return {
+                "copied": 0, "skipped": 0,
+                "errors": [], "scanned": 0,
+                "dry_run": dry_run,
+                "error": (
+                    "no bus fallback configured; set backend=composite "
+                    "to enable migration"
+                ),
+            }
+
+        # Endpoints validated; ``limit=0`` is now the "config
+        # confirmed, no actual migration requested" success path.
+        if limit == 0:
+            return {
+                "copied": 0, "skipped": 0,
+                "errors": [], "scanned": 0,
+                "dry_run": dry_run,
+            }
+
+        copied = 0
+        skipped = 0
+        errors: list[dict[str, Any]] = []
+        scanned = 0
+
+        # The bus's list endpoint accepts a ``limit`` but no
+        # cursor / before_id, so calling it twice with the same
+        # filter args returns the same first ``limit`` rows. A
+        # naive paging loop would spin forever (after the first
+        # page every subsequent page is "all already seen") or
+        # exit after one page either way — we just call once and
+        # honestly limit the migration to the first ``limit``
+        # rows. Operators with larger corpora re-run via filter
+        # variants once the bus's list surface grows a cursor
+        # (Phase 4c follow-up).
+        page = await fallback_source.list(limit=limit)
+        if isinstance(page, dict):
+            # Include ``dry_run`` here too so callers see a
+            # consistent response shape on every code path,
+            # not just the success branch.
+            return {
+                "copied": copied, "skipped": skipped,
+                "errors": errors, "scanned": scanned,
+                "dry_run": dry_run,
+                "error": page.get("error", "bus list failed"),
+            }
+        for meta in page:
+            if not isinstance(meta, dict):
+                continue
+            raw_id = str(meta.get("id") or "")
+            # Strip whitespace to match the normalization done in
+            # ``_required_id`` / ``handle_artifact_create``;
+            # otherwise a whitespace-suffixed id round-trips into
+            # local SQLite with the suffix and never matches a
+            # subsequent ``art_xyz`` read.
+            aid = raw_id.strip()
+            scanned += 1
+            outcome = await _migrate_one(
+                aid=aid, meta=meta,
+                source=fallback_source,
+                target=local_target,
+                dry_run=dry_run,
+            )
+            if outcome == "copied":
+                copied += 1
+            elif outcome == "skipped":
+                skipped += 1
+            else:
+                # Preserve the pre-strip id (or a sentinel) in
+                # error reports so an operator can grep the bus
+                # corpus for the offending row. Three cases:
+                # truly missing → ``<missing>``; a
+                # whitespace-only id (which strips to empty) →
+                # ``<whitespace-only id: '...'>`` so the
+                # original whitespace is visible; otherwise the
+                # raw id passes through.
+                if raw_id == "":
+                    reported_id = "<missing>"
+                elif raw_id.strip() == "":
+                    reported_id = f"<whitespace-only id: {raw_id!r}>"
+                else:
+                    reported_id = raw_id
+                errors.append({"id": reported_id, "error": outcome})
+
+        return {
+            "copied": copied,
+            "skipped": skipped,
+            "errors": errors,
+            "scanned": scanned,
+            "dry_run": dry_run,
+        }
+
     # -- display ----------------------------------------------------------
 
     @handler("display")
@@ -638,6 +854,204 @@ class StoreAgent(BaseAgent):
             or "text/plain"
         )
         return content_type, body, dict(meta)
+
+
+def _migration_endpoints(
+    backend: ArtifactBackend,
+) -> Tuple[Optional[ArtifactBackend], Optional[ArtifactBackend]]:
+    """Pick out (local_target, fallback_source) from the live backend.
+
+    Migration only works when the write target is a
+    :class:`LocalArtifactStore`: ``_migrate_one``'s
+    duplicate-detection path checks for ``LocalArtifactStore``'s
+    specific ``"duplicate artifact id"`` envelope, and a
+    custom local half wouldn't increment the ``skipped`` count
+    correctly. The fallback (read source) can be any
+    ``ArtifactBackend`` that satisfies the ABC; tests use stub
+    backends and production wires ``BusBackedArtifactStore``.
+
+    For ``backend=composite`` the public ``local`` / ``fallback``
+    accessors expose both halves so the migration doesn't depend
+    on private attribute names. ``backend=local`` has no
+    fallback (caller surfaces a clear error). ``backend=bus``
+    has no local target — also a misconfiguration for
+    migration.
+    """
+    if isinstance(backend, CompositeArtifactBackend):
+        local = backend.local
+        fallback = backend.fallback
+        if isinstance(local, LocalArtifactStore):
+            return local, fallback
+        # Miswired composite (custom local half): the
+        # duplicate-id envelope shape isn't guaranteed, so
+        # decline rather than report misleading skip counts.
+        return None, None
+    if isinstance(backend, LocalArtifactStore):
+        # Local-only — no fallback configured, so nothing to
+        # migrate from. The handler returns a clear error so the
+        # operator switches to backend=composite.
+        return backend, None
+    return None, None
+
+
+# Cap for the per-artifact content fetch during migration. Sourced
+# from :data:`store.local_store.HARD_MAX_CHARS` (which mirrors the
+# bus's REST clamp) so changing the cap in one place propagates
+# here too. The previous 11M ceiling was effectively dead — bus
+# clamped the request to 20K anyway — but would have permitted
+# very large transfers against a non-bus backend that honored
+# ``max_chars`` directly. A fetch of an artifact larger than this
+# cap returns ``truncated=True`` and ``_migrate_one`` records it
+# as a per-artifact error rather than writing partial content.
+# Phase 4c may revisit by switching migration to a streaming
+# endpoint.
+_MIGRATION_FETCH_CAP_CHARS = HARD_MAX_CHARS
+
+
+def _bool_arg(args: dict[str, Any], name: str, default: bool = False) -> bool:
+    """Coerce ``args[name]`` to bool with strict policy.
+
+    Real ``bool`` values pass through unchanged. Common
+    case-insensitive string forms are accepted because some bus
+    clients route args through JSON or YAML and the human-typed
+    shape varies:
+
+    * truthy: ``"true"``, ``"1"``, ``"yes"``
+    * falsy: ``"false"``, ``"0"``, ``"no"``, ``""`` (empty string
+      maps to the default-falsy convention used elsewhere in
+      this module)
+
+    Anything else raises ``ValueError`` so the handler can
+    return a clean envelope — silently treating ``"false"`` as
+    truthy (the default ``bool(value)`` policy on non-empty
+    strings) was the surprising behavior the previous version
+    exhibited.
+    """
+    if name not in args:
+        return default
+    value = args[name]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in ("true", "1", "yes"):
+            return True
+        if norm in ("false", "0", "no", ""):
+            return False
+    raise ValueError(f"{name} must be a boolean")
+
+
+async def _migrate_one(
+    *,
+    aid: str,
+    meta: dict[str, Any],
+    source: ArtifactBackend,
+    target: ArtifactBackend,
+    dry_run: bool,
+) -> str:
+    """Copy a single artifact from source → target.
+
+    Returns ``"copied"`` / ``"skipped"`` / ``"<error string>"``.
+    Pre-flight validates required fields and skips ids already
+    present locally so dry-run counts match what a real run
+    would do.
+    """
+    if not aid:
+        return "missing id"
+
+    # Match ``handle_artifact_create``'s normalization so a
+    # whitespace-only ``"   "`` from the bus side doesn't pass
+    # validation and end up persisted locally.
+    kind = str(meta.get("kind") or "").strip()
+    title = str(meta.get("title") or "").strip()
+    if not kind:
+        return "create failed: kind is required"
+    if not title:
+        return "create failed: title is required"
+
+    # Existence check up front: a duplicate-id row will be
+    # skipped on the real run, so report it in dry-run too. The
+    # metadata round-trip is cheap (no content) and keeps
+    # ``copied`` / ``skipped`` aligned across modes. Only the
+    # explicit ``"artifact not found"`` envelope falls through
+    # to fetch — a different error (e.g. ``"local store error"``
+    # from a sqlite failure) surfaces per-artifact so a real
+    # local-side issue isn't masked by an attempted create.
+    existing = await target.metadata(aid)
+    if isinstance(existing, dict):
+        if "error" not in existing:
+            return "skipped"
+        if existing.get("error") != "artifact not found":
+            return f"metadata failed: {existing['error']}"
+
+    body = await source.get(aid, offset=0, max_chars=_MIGRATION_FETCH_CAP_CHARS)
+    if not isinstance(body, dict):
+        # An ABC-conforming backend always returns a dict; a stub
+        # or a custom backend that violates the contract would
+        # otherwise crash at ``body.get(...)``. Surface as a
+        # per-artifact error rather than letting it abort the
+        # whole migration run.
+        return f"fetch returned non-dict: {type(body).__name__}"
+    if "error" in body:
+        return f"fetch failed: {body['error']}"
+    if body.get("truncated") is True:
+        # Don't silently migrate partial content. The bus's REST
+        # surface caps reads at HARD_MAX_CHARS=20000 today; this
+        # cap could be raised in the future, but until then the
+        # migration's content fetch must NOT be truncated. Surface
+        # the truncation as a per-artifact error so the operator
+        # knows which ids need a different transport.
+        return "fetch truncated"
+    text = body.get("text") or body.get("body") or ""
+    if not isinstance(text, str):
+        return "non-string content"
+    if dry_run:
+        return "copied"
+    raw_sources = meta.get("source_artifacts")
+    sources = (
+        # Coerce every element to ``str`` to match
+        # ``handle_artifact_create``'s normalization (avoids
+        # persisting unexpected element types like ints).
+        [str(s) for s in raw_sources]
+        if isinstance(raw_sources, list)
+        else []
+    )
+    raw_ttl = meta.get("ttl")
+    # Match ``handle_artifact_create``'s normalization exactly:
+    # ``str(raw or "").strip() or None``. Anything falsey
+    # (including ``0`` / ``False`` / ``""`` / whitespace-only)
+    # collapses to ``None`` so we don't persist invalid TTLs
+    # like the literal string ``"0"`` or ``"False"`` that the
+    # type system would read as "has TTL".
+    ttl: Optional[str] = str(raw_ttl or "").strip() or None
+    try:
+        result = await target.create(
+            kind=kind,
+            title=title,
+            content=text,
+            producer=str(meta.get("producer") or ""),
+            session_id=str(meta.get("session_id") or ""),
+            trace_id=str(meta.get("trace_id") or ""),
+            content_type=str(meta.get("content_type") or "text/plain"),
+            metadata=meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {},
+            source_artifacts=sources,
+            artifact_id=aid,
+            ttl=ttl,
+        )
+    except NotImplementedError as exc:
+        # ABC default raise (read-only backend) — should be
+        # impossible from the composite path that selected
+        # ``backend.local`` as the target, but a custom or
+        # miswired backend could still hit this. Surface the
+        # crash as a per-artifact error so the migration keeps
+        # iterating instead of taking down the whole skill.
+        return f"create failed: {exc}"
+    if isinstance(result, dict) and "error" in result:
+        err = result["error"]
+        if "duplicate artifact id" in err:
+            return "skipped"
+        return f"create failed: {err}"
+    return "copied"
 
 
 def _required_id(args: dict[str, Any]) -> str:

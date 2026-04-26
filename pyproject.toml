@@ -1,7 +1,7 @@
 [project]
 name = "khonliang-store"
-version = "0.5.0"
-description = "Bus-native store agent — artifact reads (Phase 2) + browser viewer (Phase 3) + local SQLite write surface (Phase 4a); composite read backend + bus deprecation follow"
+version = "0.6.0"
+description = "Bus-native store agent — artifact reads (Phase 2) + viewer (Phase 3) + local SQLite writes (Phase 4a) + composite local/bus reads & migration (Phase 4b); bus deprecation follows"
 requires-python = ">=3.11"
 dependencies = [
     "khonliang-bus-lib",

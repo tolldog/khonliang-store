@@ -4,7 +4,7 @@ Bus-native store agent. Target eventual owner of the artifact backend
 (currently served by the bus's `bus_artifact_*` MCP surface) and host
 of a browser-based viewer mode for rendered artifacts.
 
-## Status — Phase 4a writes + Phase 2 reads + Phase 3 viewer landed; bus deprecation follows
+## Status — Phase 4b composite + migration landed; bus deprecation follows
 
 Registered bus agent. Skill surface today:
 
@@ -13,42 +13,44 @@ Registered bus agent. Skill surface today:
   `artifact_grep`, `artifact_excerpt`. All seven route through
   an `ArtifactBackend` abstraction.
 - **Write API** — `artifact_create(kind, title, content, ...)`
-  — persists a new artifact via the configured backend. Returns
-  the new artifact's metadata (id, sha256, size_bytes, …) on
-  success or `{error: ...}` on validation failure.
+  — persists a new artifact via the configured backend.
+- **Migration** — `artifact_migrate_from_bus(limit, dry_run)`
+  reads the bus's REST list and copies each artifact into the
+  local SQLite store, preserving ids. Idempotent; successful
+  calls return `{copied, skipped, errors, scanned, dry_run}`.
+  Failure responses may also carry an `error` key — for
+  example, when the configured backend doesn't support
+  migration, when `dry_run` or `limit` arguments are
+  malformed, or when the bus list request itself fails. The
+  bus's list endpoint has no cursor today, so the skill
+  processes at most `limit` artifacts (capped at 100) per
+  call.
 - **`display(artifacts, layout='tabs')`** — lazy in-process HTTP
-  viewer that pre-fetches via the same `ArtifactBackend`
-  (in-process call, no bus round-trip), and returns a browser
-  URL. Renderers cover markdown (marked.js CDN), JSON
-  (click-to-collapse), graphviz (local `dot -Tsvg` rendered via
-  base64-data `<img>`), prism.js code highlighting, and a `<pre>`
-  fallback. Extensible via `@register_renderer("type/x")`.
+  viewer that pre-fetches via the same `ArtifactBackend` and
+  returns a browser URL. Renderer registry extensible via
+  `@register_renderer("type/x")`.
 
-Backends are config-driven via `[artifacts] backend: bus | local`
-(see `config.example.yaml`). The default `bus` keeps Phase-2
-behavior — proxy reads to the bus's REST surface, reject writes
-with a clear error envelope. Switch to `local` to use the new
-SQLite-backed `LocalArtifactStore`; writes persist locally and
-all reads come from the local DB.
+Backends are config-driven via `[artifacts] backend: bus |
+local | composite` (see `config.example.yaml`). The default
+`bus` keeps the Phase-2 read-only proxy behavior; `local`
+switches to the SQLite write path with no bus fallback;
+`composite` (Phase 4b, recommended for migrating deployments)
+writes locally and reads check local-first with bus fallback.
 
-Tracked under `fr_store_73e5a6f4` (writes), `fr_store_08c1c6b2`
-(reads), `fr_store_d22556bb` (viewer). Phase-1 scaffold under
+Tracked under `fr_store_ef668d56` (composite + migration),
+`fr_store_73e5a6f4` (writes), `fr_store_08c1c6b2` (reads),
+`fr_store_d22556bb` (viewer). Phase-1 scaffold under
 `fr_store_4ea7d48b` is complete.
 
 ## Phase status
 
 - **Phase 1 — scaffold** ✅ shipped (PR #1).
 - **Phase 2 — artifact read skills** ✅ shipped (PR #3).
-  `ArtifactBackend` ABC + `BusBackedArtifactStore` HTTP backend;
-  viewer fetch path goes through the same backend in-process.
 - **Phase 3 — viewer mode** ✅ shipped (PR #2).
-- **Phase 4a — local write surface** ✅ shipped.
-  `LocalArtifactStore` (SQLite) + `artifact_create`; backend
-  selection via config; default unchanged.
-- **Phase 4b** — `CompositeArtifactBackend(local, bus)` for
-  union reads + bus → local migration tooling. _Open._
+- **Phase 4a — local write surface** ✅ shipped (PR #4).
+- **Phase 4b — composite backend + migration** ✅ shipped.
 - **Phase 4c** — deprecate bus's `bus_artifact_*` HTTP routes
-  once 4b's migration has run. _Open._
+  once operators have run the migration. _Open._
 - **Phase 5 — researcher integration** — _open_. Wires
   `fr_researcher_000ad07c`'s `stage_payload` / `ingest_from_artifact`
   through the store once writes land.
