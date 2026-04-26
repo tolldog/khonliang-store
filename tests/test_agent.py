@@ -407,3 +407,53 @@ async def test_read_skills_pass_through_backend_error_envelope(harness, backend)
     backend.response = {"error": "artifact not found"}
     result = await harness.call("artifact_metadata", {"id": "art_missing"})
     assert result == {"error": "artifact not found"}
+
+
+# -- backend lifecycle --------------------------------------------------------
+
+
+def test_set_backend_returns_previous(harness):
+    """Caller can recover the previous backend and dispose of it
+    on its own schedule (we deliberately don't auto-close).
+    """
+    initial = harness.agent._backend
+    fake = FakeBackend()
+    returned = harness.agent.set_backend(fake)
+    assert returned is initial
+    assert harness.agent._backend is fake
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_owned_backend(harness):
+    """``BusBackedArtifactStore`` owns an httpx client; shutdown
+    must close it so the process doesn't emit unclosed-client
+    warnings on exit.
+    """
+    closed = {"flag": False}
+
+    class CloseRecording(FakeBackend):
+        async def close(self) -> None:  # type: ignore[override]
+            closed["flag"] = True
+
+    harness.agent.set_backend(CloseRecording())
+    # BaseAgent.shutdown disconnects the websocket and closes
+    # internal state. The harness leaves the connector unstarted
+    # so we patch _connector to None to make shutdown a no-op
+    # apart from the backend close path under test.
+    harness.agent._connector = None
+    await harness.agent.shutdown()
+    assert closed["flag"] is True
+
+
+@pytest.mark.asyncio
+async def test_shutdown_swallows_backend_close_errors(harness, caplog):
+    """A backend.close() raising shouldn't take down agent
+    shutdown — the rest of the teardown still needs to run.
+    """
+    class RaiseOnClose(FakeBackend):
+        async def close(self) -> None:  # type: ignore[override]
+            raise RuntimeError("backend wedged")
+
+    harness.agent.set_backend(RaiseOnClose())
+    harness.agent._connector = None
+    await harness.agent.shutdown()  # must not raise

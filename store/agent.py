@@ -46,6 +46,8 @@ from khonliang_bus import BaseAgent, Skill, handler
 from store.artifacts import ArtifactBackend, BusBackedArtifactStore
 from store.viewer import ArtifactRef, PreparedTab, display as viewer_display
 
+logger = logging.getLogger(__name__)
+
 
 # Cap on parallel artifact fetches per display() call. Tuned for
 # "interactive viewer call against a single bus" rather than batch
@@ -74,9 +76,39 @@ class StoreAgent(BaseAgent):
         super().__init__(*args, **kwargs)
         self._backend: ArtifactBackend = BusBackedArtifactStore(self.bus_url)
 
-    def set_backend(self, backend: ArtifactBackend) -> None:
-        """Override the backend (tests + future Phase-4 swap)."""
+    def set_backend(self, backend: ArtifactBackend) -> ArtifactBackend:
+        """Override the backend (tests + future Phase-4 swap).
+
+        Returns the previous backend so callers that own its
+        lifecycle can close it themselves. We don't auto-close
+        because (a) tests pass in fakes that have no close()
+        anyway, and (b) doing it for the caller would force this
+        method to be async and would tangle test setup (the test
+        harness installs the backend before the event loop starts).
+        """
+        previous = self._backend
         self._backend = backend
+        return previous
+
+    async def shutdown(self) -> None:
+        """Tear down: close the artifact backend before disconnecting.
+
+        ``BaseAgent.shutdown`` closes the WebSocket and the
+        internal httpx client; the artifact backend has its own
+        httpx client (the one that talks to the bus REST surface)
+        which we own and must close too — otherwise process exit
+        emits "unclosed client" warnings.
+        """
+        close = getattr(self._backend, "close", None)
+        if close is not None:
+            try:
+                await close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "store backend close raised %s: %s",
+                    type(exc).__name__, exc,
+                )
+        await super().shutdown()
 
     def register_skills(self) -> list[Skill]:
         return [

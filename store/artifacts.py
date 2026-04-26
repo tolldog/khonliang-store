@@ -20,9 +20,28 @@ relationship; preserving that shape keeps Phase 2 self-contained.
 from __future__ import annotations
 
 import abc
-from typing import Any, Optional
+from typing import Any, Optional, Union
+from urllib.parse import quote
 
 import httpx
+
+
+# Returned by list() when the underlying request errors. The bus's
+# canonical list endpoint emits a list on success, so a dict with
+# an ``error`` key is the unambiguous failure shape and lets
+# callers distinguish "outage" from "zero artifacts".
+ListResult = Union[list[dict[str, Any]], dict[str, Any]]
+
+
+def _encode_id(artifact_id: str) -> str:
+    """Quote an artifact id as a single URL path segment.
+
+    Bus artifact ids are 12-byte hex today, so no quoting is
+    strictly necessary; encoding defensively means a future ID
+    scheme that includes ``/`` or ``?`` (or a malicious caller
+    that synthesizes one) can't change the requested route.
+    """
+    return quote(artifact_id, safe="")
 
 
 class ArtifactBackend(abc.ABC):
@@ -42,7 +61,7 @@ class ArtifactBackend(abc.ABC):
         kind: str = "",
         producer: str = "",
         limit: int = 20,
-    ) -> list[dict[str, Any]]: ...
+    ) -> ListResult: ...
 
     @abc.abstractmethod
     async def metadata(self, artifact_id: str) -> dict[str, Any]: ...
@@ -134,7 +153,7 @@ class BusBackedArtifactStore(ArtifactBackend):
         kind: str = "",
         producer: str = "",
         limit: int = 20,
-    ) -> list[dict[str, Any]]:
+    ) -> ListResult:
         params = {
             "session_id": session_id,
             "kind": kind,
@@ -142,10 +161,17 @@ class BusBackedArtifactStore(ArtifactBackend):
             "limit": limit,
         }
         result = await self._get_json("/v1/artifacts", params=params)
-        return result if isinstance(result, list) else []
+        if isinstance(result, list):
+            return result
+        # Preserve error envelopes (network failure / 4xx / 5xx /
+        # non-JSON) so a transport blip is distinguishable from a
+        # genuine "zero artifacts match these filters" result.
+        if isinstance(result, dict) and "error" in result:
+            return result
+        return {"error": "bus returned unexpected list shape"}
 
     async def metadata(self, artifact_id: str) -> dict[str, Any]:
-        return await self._get_json(f"/v1/artifacts/{artifact_id}")
+        return await self._get_json(f"/v1/artifacts/{_encode_id(artifact_id)}")
 
     async def get(
         self,
@@ -155,7 +181,7 @@ class BusBackedArtifactStore(ArtifactBackend):
         max_chars: int = 4000,
     ) -> dict[str, Any]:
         return await self._get_json(
-            f"/v1/artifacts/{artifact_id}/content",
+            f"/v1/artifacts/{_encode_id(artifact_id)}/content",
             params={"offset": offset, "max_chars": max_chars},
         )
 
@@ -167,7 +193,7 @@ class BusBackedArtifactStore(ArtifactBackend):
         max_chars: int = 4000,
     ) -> dict[str, Any]:
         return await self._get_json(
-            f"/v1/artifacts/{artifact_id}/head",
+            f"/v1/artifacts/{_encode_id(artifact_id)}/head",
             params={"lines": lines, "max_chars": max_chars},
         )
 
@@ -179,7 +205,7 @@ class BusBackedArtifactStore(ArtifactBackend):
         max_chars: int = 4000,
     ) -> dict[str, Any]:
         return await self._get_json(
-            f"/v1/artifacts/{artifact_id}/tail",
+            f"/v1/artifacts/{_encode_id(artifact_id)}/tail",
             params={"lines": lines, "max_chars": max_chars},
         )
 
@@ -193,7 +219,7 @@ class BusBackedArtifactStore(ArtifactBackend):
         max_chars: int = 4000,
     ) -> dict[str, Any]:
         return await self._get_json(
-            f"/v1/artifacts/{artifact_id}/grep",
+            f"/v1/artifacts/{_encode_id(artifact_id)}/grep",
             params={
                 "pattern": pattern,
                 "context_lines": context_lines,
@@ -211,7 +237,7 @@ class BusBackedArtifactStore(ArtifactBackend):
         max_chars: int = 4000,
     ) -> dict[str, Any]:
         return await self._get_json(
-            f"/v1/artifacts/{artifact_id}/excerpt",
+            f"/v1/artifacts/{_encode_id(artifact_id)}/excerpt",
             params={
                 "start_line": start_line,
                 "end_line": end_line,
