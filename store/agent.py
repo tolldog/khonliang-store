@@ -614,12 +614,20 @@ class StoreAgent(BaseAgent):
         except ValueError as exc:
             return {"error": str(exc)}
         # Cap at 100 to match the bus's MAX_LIST_LIMIT — asking
-        # for more wastes a round trip. Floor at 1 so the loop
-        # terminates.
-        if limit < 1:
-            limit = 1
+        # for more wastes a round trip. Allow 0 as an explicit
+        # no-op (e.g. a connectivity / configuration smoke test
+        # that returns the standard response shape with zero
+        # counts).
+        if limit < 0:
+            limit = 0
         if limit > 100:
             limit = 100
+        if limit == 0:
+            return {
+                "copied": 0, "skipped": 0,
+                "errors": [], "scanned": 0,
+                "dry_run": dry_run,
+            }
 
         local_target, fallback_source = _migration_endpoints(self._backend)
         if local_target is None:
@@ -850,14 +858,21 @@ _MIGRATION_FETCH_CAP_CHARS = 11_000_000
 def _bool_arg(args: dict[str, Any], name: str, default: bool = False) -> bool:
     """Coerce ``args[name]`` to bool with strict policy.
 
-    Real ``bool`` values pass through unchanged. The strings
-    ``"true"`` / ``"false"`` / ``"1"`` / ``"0"`` (case-insensitive)
-    are accepted because some bus clients route args through JSON
-    or YAML and the human-typed shape varies. Anything else
-    raises ``ValueError`` so the handler can return a clean
-    envelope — silently treating ``"false"`` as truthy (the
-    default ``bool(value)`` policy on non-empty strings) was the
-    surprising behavior the previous version exhibited.
+    Real ``bool`` values pass through unchanged. Common
+    case-insensitive string forms are accepted because some bus
+    clients route args through JSON or YAML and the human-typed
+    shape varies:
+
+    * truthy: ``"true"``, ``"1"``, ``"yes"``
+    * falsy: ``"false"``, ``"0"``, ``"no"``, ``""`` (empty string
+      maps to the default-falsy convention used elsewhere in
+      this module)
+
+    Anything else raises ``ValueError`` so the handler can
+    return a clean envelope — silently treating ``"false"`` as
+    truthy (the default ``bool(value)`` policy on non-empty
+    strings) was the surprising behavior the previous version
+    exhibited.
     """
     if name not in args:
         return default
@@ -936,23 +951,32 @@ async def _migrate_one(
         return "non-string content"
     if dry_run:
         return "copied"
-    result = await target.create(
-        kind=kind,
-        title=title,
-        content=text,
-        producer=str(meta.get("producer") or ""),
-        session_id=str(meta.get("session_id") or ""),
-        trace_id=str(meta.get("trace_id") or ""),
-        content_type=str(meta.get("content_type") or "text/plain"),
-        metadata=meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {},
-        source_artifacts=(
-            meta.get("source_artifacts")
-            if isinstance(meta.get("source_artifacts"), list)
-            else []
-        ),
-        artifact_id=aid,
-        ttl=meta.get("ttl"),
-    )
+    try:
+        result = await target.create(
+            kind=kind,
+            title=title,
+            content=text,
+            producer=str(meta.get("producer") or ""),
+            session_id=str(meta.get("session_id") or ""),
+            trace_id=str(meta.get("trace_id") or ""),
+            content_type=str(meta.get("content_type") or "text/plain"),
+            metadata=meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {},
+            source_artifacts=(
+                meta.get("source_artifacts")
+                if isinstance(meta.get("source_artifacts"), list)
+                else []
+            ),
+            artifact_id=aid,
+            ttl=meta.get("ttl"),
+        )
+    except NotImplementedError as exc:
+        # ABC default raise (read-only backend) — should be
+        # impossible from the composite path that selected
+        # ``backend.local`` as the target, but a custom or
+        # miswired backend could still hit this. Surface the
+        # crash as a per-artifact error so the migration keeps
+        # iterating instead of taking down the whole skill.
+        return f"create failed: {exc}"
     if isinstance(result, dict) and "error" in result:
         err = result["error"]
         if "duplicate artifact id" in err:

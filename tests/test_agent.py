@@ -724,8 +724,11 @@ def test_build_backend_composite_pairs_local_and_bus(tmp_path):
     cfg.write_text("artifacts:\n  backend: composite\n")
     backend = _build_backend(config_path=str(cfg), bus_url="http://bus")
     assert isinstance(backend, CompositeArtifactBackend)
-    assert isinstance(backend._local, LocalArtifactStore)
-    assert isinstance(backend._fallback, BusBackedArtifactStore)
+    # Use the public accessors rather than reaching into
+    # ``_local`` / ``_fallback`` — the public surface is the
+    # API we promise to migration tooling.
+    assert isinstance(backend.local, LocalArtifactStore)
+    assert isinstance(backend.fallback, BusBackedArtifactStore)
 
 
 # -- artifact_migrate_from_bus -----------------------------------------------
@@ -914,6 +917,93 @@ async def test_migrate_dry_run_logs_without_writing(harness, tmp_path):
 async def test_migrate_skill_advertised(harness):
     skill_names = {s["name"] for s in harness.registration.skills}
     assert "artifact_migrate_from_bus" in skill_names
+
+
+@pytest.mark.asyncio
+async def test_migrate_with_zero_limit_is_noop(harness, tmp_path):
+    """``limit=0`` is a "doesn't actually migrate, just confirm
+    config" smoke test. The handler returns the standard
+    response shape with zero counts and never round-trips the
+    fallback.
+    """
+    from store.local_store import LocalArtifactStore
+    from store.composite import CompositeArtifactBackend
+
+    list_calls: list = []
+
+    class _Bus(ArtifactBackend):
+        async def list(self, **kw):
+            list_calls.append(kw)
+            return [{"id": "art_a", "kind": "note", "title": "A"}]
+        async def metadata(self, aid): return {"id": aid}
+        async def get(self, aid, **kw): return {"text": "x"}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    local = LocalArtifactStore(str(tmp_path / "noop.db"))
+    composite = CompositeArtifactBackend(local=local, fallback=_Bus())
+    previous = harness.agent.set_backend(composite)
+    try:
+        result = await harness.call("artifact_migrate_from_bus", {"limit": 0})
+        assert result == {
+            "copied": 0, "skipped": 0,
+            "errors": [], "scanned": 0,
+            "dry_run": False,
+        }
+        # Bus list() must NOT have been called — the no-op
+        # short-circuit is what makes it a useful smoke test.
+        assert list_calls == []
+    finally:
+        await composite.close()
+        await previous.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_handles_create_not_implemented_on_target(harness, tmp_path):
+    """A miswired backend whose ``create()`` raises
+    ``NotImplementedError`` (the ABC default for read-only
+    backends) used to abort the entire skill handler. Now the
+    failure surfaces as a per-artifact error and the migration
+    keeps iterating.
+    """
+    from store.composite import CompositeArtifactBackend
+
+    class _ReadOnlyTarget(ArtifactBackend):
+        async def list(self, **kw): return []
+        async def metadata(self, aid): return {"error": "artifact not found"}
+        async def get(self, aid, **kw): return {"error": "artifact not found"}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+        # Inherits the ABC's NotImplementedError default for create()
+
+    class _Bus(ArtifactBackend):
+        async def list(self, **kw):
+            return [{"id": "art_x", "kind": "note", "title": "X"}]
+        async def metadata(self, aid):
+            return {"id": "art_x", "kind": "note", "title": "X"}
+        async def get(self, aid, **kw):
+            return {"artifact": {"id": "art_x"}, "text": "x"}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    composite = CompositeArtifactBackend(local=_ReadOnlyTarget(), fallback=_Bus())
+    previous = harness.agent.set_backend(composite)
+    try:
+        result = await harness.call("artifact_migrate_from_bus", {})
+        assert result["copied"] == 0
+        assert result["skipped"] == 0
+        assert len(result["errors"]) == 1
+        assert "create failed" in result["errors"][0]["error"]
+        assert "read-only" in result["errors"][0]["error"]
+    finally:
+        await composite.close()
+        await previous.close()
 
 
 @pytest.mark.asyncio
