@@ -148,8 +148,10 @@ async def test_get_falls_through_with_kwargs_threaded():
 
 @pytest.mark.asyncio
 async def test_each_read_method_falls_through_independently():
-    """All seven read methods must follow the same fall-through
-    policy — easy to forget one when wiring them up.
+    """All six per-id read methods must follow the same
+    fall-through policy — easy to forget one when wiring them
+    up. ``list()`` has its own union-merge policy and is
+    covered by the dedicated list tests below.
     """
     not_found_responses: dict[str, Any] = {}  # all return default not-found
     local = _Recorder("local", not_found_responses)

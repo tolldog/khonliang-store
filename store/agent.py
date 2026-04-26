@@ -622,13 +622,13 @@ class StoreAgent(BaseAgent):
             limit = 0
         if limit > 100:
             limit = 100
-        if limit == 0:
-            return {
-                "copied": 0, "skipped": 0,
-                "errors": [], "scanned": 0,
-                "dry_run": dry_run,
-            }
 
+        # Validate endpoints BEFORE the ``limit==0`` no-op
+        # short-circuit so a misconfigured backend doesn't get a
+        # false-positive "all good" response. ``limit=0`` is meant
+        # to be a "config + plumbing wired correctly?" smoke test;
+        # silently reporting success when the backend has nothing
+        # to migrate to/from would defeat that.
         local_target, fallback_source = _migration_endpoints(self._backend)
         if local_target is None:
             # Maintain the standard response shape on
@@ -656,6 +656,15 @@ class StoreAgent(BaseAgent):
                     "no bus fallback configured; set backend=composite "
                     "to enable migration"
                 ),
+            }
+
+        # Endpoints validated; ``limit=0`` is now the "config
+        # confirmed, no actual migration requested" success path.
+        if limit == 0:
+            return {
+                "copied": 0, "skipped": 0,
+                "errors": [], "scanned": 0,
+                "dry_run": dry_run,
             }
 
         copied = 0

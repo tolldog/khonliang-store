@@ -920,11 +920,25 @@ async def test_migrate_skill_advertised(harness):
 
 
 @pytest.mark.asyncio
+async def test_migrate_with_zero_limit_validates_then_no_ops(harness, backend):
+    """``limit=0`` is a "config + plumbing wired?" smoke test —
+    so a misconfigured backend (read-only, no fallback) must
+    still produce the misconfiguration error. Without the
+    validation-before-short-circuit ordering, ``limit=0`` would
+    return a false-positive success envelope.
+    """
+    # FakeBackend isn't a Local or Composite, so endpoints check fails.
+    result = await harness.call("artifact_migrate_from_bus", {"limit": 0})
+    assert "error" in result
+    assert "local backend" in result["error"]
+
+
+@pytest.mark.asyncio
 async def test_migrate_with_zero_limit_is_noop(harness, tmp_path):
     """``limit=0`` is a "doesn't actually migrate, just confirm
-    config" smoke test. The handler returns the standard
-    response shape with zero counts and never round-trips the
-    fallback.
+    config" smoke test. With endpoints valid the handler
+    returns the standard response shape with zero counts and
+    never round-trips the fallback.
     """
     from store.local_store import LocalArtifactStore
     from store.composite import CompositeArtifactBackend
