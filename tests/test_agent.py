@@ -14,7 +14,7 @@ import pytest
 from khonliang_bus.testing import AgentTestHarness
 
 from store.agent import StoreAgent, _parse_artifact_refs
-from store.artifacts import ArtifactBackend
+from store.artifacts import ArtifactBackend, ListResult
 from store.viewer import ArtifactRef
 from store.viewer import server as viewer_server
 
@@ -38,7 +38,11 @@ class FakeBackend(ArtifactBackend):
             raise self.exc
         return self.response
 
-    async def list(self, **kwargs: Any) -> list[dict[str, Any]]:
+    async def list(self, **kwargs: Any) -> ListResult:
+        # Annotation matches ``ArtifactBackend.list``: real
+        # backends can return either the list of metadata dicts
+        # or a single error-envelope dict on transport failure,
+        # and the tests exercise both shapes.
         return self._record("list", **kwargs)
 
     async def metadata(self, artifact_id: str) -> dict[str, Any]:

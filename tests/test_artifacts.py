@@ -249,14 +249,17 @@ async def test_404_on_list_route_is_not_artifact_not_found(make_handler):
 
 @pytest.mark.asyncio
 async def test_connection_error_returns_unreachable_envelope():
-    """Network failure must surface as an error envelope, not raise.
+    """Network failure must surface as a stable error envelope,
+    not raise. The skill handlers expect a dict back from the
+    backend so they can pass it straight through to the bus
+    client. An uncaught exception would crash the handler.
 
-    The skill handlers expect a dict back from the backend so they
-    can pass it straight through to the bus client. An uncaught
-    exception would crash the handler.
+    The response envelope intentionally omits the underlying
+    exception string — internal connection details (hostnames,
+    cause chains) belong in the agent log, not the API response.
     """
     def _boom(_request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("nope")
+        raise httpx.ConnectError("internal-host-12.example.local: refused")
 
     transport = httpx.MockTransport(_boom)
     client = httpx.AsyncClient(transport=transport)
@@ -265,8 +268,11 @@ async def test_connection_error_returns_unreachable_envelope():
         result = await backend.metadata("art_a")
     finally:
         await client.aclose()
-    assert "error" in result
-    assert "bus unreachable" in result["error"]
+    assert result == {"error": "bus unreachable"}
+    # And the leak surface is closed: no exception text bleed-
+    # through to the response envelope.
+    assert "internal-host-12" not in result["error"]
+    assert "ConnectError" not in result["error"]
 
 
 @pytest.mark.asyncio

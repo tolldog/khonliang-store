@@ -20,10 +20,14 @@ relationship; preserving that shape keeps Phase 2 self-contained.
 from __future__ import annotations
 
 import abc
+import logging
 from typing import Any, Optional, Union
 from urllib.parse import quote
 
 import httpx
+
+
+logger = logging.getLogger(__name__)
 
 
 # Returned by list() when the underlying request errors. The bus's
@@ -282,7 +286,19 @@ class BusBackedArtifactStore(ArtifactBackend):
         try:
             resp = await self._client.get(url, params=params or {})
         except httpx.HTTPError as exc:
-            return {"error": f"bus unreachable: {type(exc).__name__}: {exc}"}
+            # Log the full exception (with hostname / cause) for
+            # operational diagnostics; the response envelope keeps
+            # to a stable string so internal connection details
+            # don't leak through to bus clients. ``exc_info=True``
+            # captures the traceback under our logger; the WARNING
+            # level matches "transient bus blip" rather than
+            # "agent broken".
+            logger.warning(
+                "bus unreachable on GET %s: %s: %s",
+                path, type(exc).__name__, exc,
+                exc_info=True,
+            )
+            return {"error": "bus unreachable"}
         if resp.status_code == 404 and is_id_route:
             return {"error": "artifact not found"}
         if resp.status_code >= 400:
