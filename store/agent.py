@@ -50,7 +50,7 @@ from khonliang_bus import BaseAgent, Skill, handler
 
 from store.artifacts import ArtifactBackend, BusBackedArtifactStore
 from store.composite import CompositeArtifactBackend
-from store.local_store import LocalArtifactStore
+from store.local_store import LocalArtifactStore, MAX_LIST_LIMIT
 from store.viewer import ArtifactRef, PreparedTab, display as viewer_display
 
 logger = logging.getLogger(__name__)
@@ -613,15 +613,16 @@ class StoreAgent(BaseAgent):
             dry_run = _bool_arg(args, "dry_run", False)
         except ValueError as exc:
             return {"error": str(exc)}
-        # Cap at 100 to match the bus's MAX_LIST_LIMIT — asking
-        # for more wastes a round trip. Allow 0 as an explicit
-        # no-op (e.g. a connectivity / configuration smoke test
-        # that returns the standard response shape with zero
-        # counts).
+        # Cap at MAX_LIST_LIMIT (the bus's REST clamp; the
+        # local store enforces the same value) — asking for
+        # more wastes a round trip. Allow 0 as an explicit
+        # no-op (e.g. a connectivity / configuration smoke
+        # test that returns the standard response shape with
+        # zero counts).
         if limit < 0:
             limit = 0
-        if limit > 100:
-            limit = 100
+        if limit > MAX_LIST_LIMIT:
+            limit = MAX_LIST_LIMIT
 
         # Validate endpoints BEFORE the ``limit==0`` no-op
         # short-circuit so a misconfigured backend doesn't get a
@@ -635,13 +636,19 @@ class StoreAgent(BaseAgent):
             # misconfiguration paths so callers can rely on
             # consistent keys regardless of whether the run
             # succeeded, partially failed, or never started.
+            # Name the detected backend type so operators see
+            # the exact mismatch — a composite wired with a
+            # custom local half is functionally distinct from a
+            # plain bus backend, and "read-only" alone hid that.
+            backend_type = type(self._backend).__name__
             return {
                 "copied": 0, "skipped": 0,
                 "errors": [], "scanned": 0,
                 "dry_run": dry_run,
                 "error": (
-                    "artifact_migrate_from_bus requires a local backend; "
-                    "current backend is read-only"
+                    "artifact_migrate_from_bus requires "
+                    "backend=composite with a LocalArtifactStore "
+                    f"local half; current backend is {backend_type}"
                 ),
             }
         if fallback_source is None:
@@ -696,12 +703,13 @@ class StoreAgent(BaseAgent):
         for meta in page:
             if not isinstance(meta, dict):
                 continue
+            raw_id = str(meta.get("id") or "")
             # Strip whitespace to match the normalization done in
             # ``_required_id`` / ``handle_artifact_create``;
             # otherwise a whitespace-suffixed id round-trips into
             # local SQLite with the suffix and never matches a
             # subsequent ``art_xyz`` read.
-            aid = str(meta.get("id") or "").strip()
+            aid = raw_id.strip()
             scanned += 1
             outcome = await _migrate_one(
                 aid=aid, meta=meta,
@@ -714,7 +722,13 @@ class StoreAgent(BaseAgent):
             elif outcome == "skipped":
                 skipped += 1
             else:
-                errors.append({"id": aid, "error": outcome})
+                # Preserve the pre-strip id (or a sentinel) in
+                # error reports so an operator can grep the bus
+                # corpus for the offending row — a stripped
+                # empty string would otherwise show up as
+                # ``"id": ""`` and offer zero diagnostic value.
+                reported_id = raw_id or "<missing>"
+                errors.append({"id": reported_id, "error": outcome})
 
         return {
             "copied": copied,

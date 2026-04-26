@@ -745,7 +745,10 @@ async def test_migrate_requires_local_target(harness, backend):
     # FakeBackend has no migration endpoints (not Local nor Composite).
     result = await harness.call("artifact_migrate_from_bus", {})
     assert "error" in result
-    assert "local backend" in result["error"]
+    # Error names the required backend kind + the detected
+    # type so operators see the exact mismatch.
+    assert "backend=composite" in result["error"]
+    assert "LocalArtifactStore" in result["error"]
     # Standard response keys are present even on the
     # misconfiguration path.
     for key in ("copied", "skipped", "errors", "scanned", "dry_run"):
@@ -930,7 +933,7 @@ async def test_migrate_with_zero_limit_validates_then_no_ops(harness, backend):
     # FakeBackend isn't a Local or Composite, so endpoints check fails.
     result = await harness.call("artifact_migrate_from_bus", {"limit": 0})
     assert "error" in result
-    assert "local backend" in result["error"]
+    assert "backend=composite" in result["error"]
 
 
 @pytest.mark.asyncio
@@ -1056,8 +1059,10 @@ async def test_migrate_rejects_miswired_composite(harness, tmp_path):
         result = await harness.call("artifact_migrate_from_bus", {})
         assert "error" in result
         # _migration_endpoints rejected the miswired composite at
-        # the "no local target" check.
-        assert "local backend" in result["error"]
+        # the "no local target" check; the new error message
+        # names the required backend shape and the detected type.
+        assert "LocalArtifactStore" in result["error"]
+        assert "CompositeArtifactBackend" in result["error"]
     finally:
         await composite.close()
         await previous.close()
