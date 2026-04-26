@@ -904,3 +904,117 @@ async def test_migrate_dry_run_logs_without_writing(harness, tmp_path):
 async def test_migrate_skill_advertised(harness):
     skill_names = {s["name"] for s in harness.registration.skills}
     assert "artifact_migrate_from_bus" in skill_names
+
+
+@pytest.mark.asyncio
+async def test_migrate_dry_run_reports_skipped_when_already_local(harness, tmp_path):
+    """``dry_run`` must mirror the real run's outcome counts:
+    when an id is already present locally, both modes should
+    report ``skipped``. Previously dry-run reported ``copied``
+    even for ids that would skip on a real run.
+    """
+    from store.local_store import LocalArtifactStore
+    from store.composite import CompositeArtifactBackend
+
+    local = LocalArtifactStore(str(tmp_path / "dry-skip.db"))
+    # Pre-populate locally so the migration would skip.
+    await local.create(kind="note", title="X", content="x", artifact_id="art_x")
+
+    state = {
+        "art_x": {"meta": {"id": "art_x", "kind": "note", "title": "X"}, "content": "x"},
+    }
+
+    class _Bus(ArtifactBackend):
+        async def list(self, **kw): return [v["meta"] for v in state.values()]
+        async def metadata(self, aid): return state[aid]["meta"]
+        async def get(self, aid, **kw):
+            return {"artifact": state[aid]["meta"], "text": state[aid]["content"]}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    composite = CompositeArtifactBackend(local=local, fallback=_Bus())
+    previous = harness.agent.set_backend(composite)
+    try:
+        result = await harness.call("artifact_migrate_from_bus", {"dry_run": True})
+        assert result["copied"] == 0
+        assert result["skipped"] == 1
+    finally:
+        await composite.close()
+        await previous.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_records_truncation_as_error(harness, tmp_path):
+    """If the source-side fetch came back truncated, the
+    migration must NOT silently write partial content. The
+    artifact ends up in ``errors`` instead of ``copied``.
+    """
+    from store.local_store import LocalArtifactStore
+    from store.composite import CompositeArtifactBackend
+
+    local = LocalArtifactStore(str(tmp_path / "truncated.db"))
+
+    class _Bus(ArtifactBackend):
+        async def list(self, **kw):
+            return [{"id": "art_big", "kind": "note", "title": "Big"}]
+        async def metadata(self, aid):
+            return {"id": "art_big", "kind": "note", "title": "Big"}
+        async def get(self, aid, **kw):
+            return {
+                "artifact": {"id": "art_big"},
+                "text": "partial-only",
+                "truncated": True,
+            }
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    composite = CompositeArtifactBackend(local=local, fallback=_Bus())
+    previous = harness.agent.set_backend(composite)
+    try:
+        result = await harness.call("artifact_migrate_from_bus", {})
+        assert result["copied"] == 0
+        assert result["skipped"] == 0
+        assert len(result["errors"]) == 1
+        assert result["errors"][0]["error"] == "fetch truncated"
+        # And the local DB should NOT have the partial row.
+        meta = await local.metadata("art_big")
+        assert meta == {"error": "artifact not found"}
+    finally:
+        await composite.close()
+        await previous.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_bus_list_failure_includes_dry_run(harness, tmp_path):
+    """The skill contract advertises ``dry_run`` on every
+    response shape; the bus-list-failure path must include it
+    too so callers can rely on consistent keys.
+    """
+    from store.local_store import LocalArtifactStore
+    from store.composite import CompositeArtifactBackend
+
+    local = LocalArtifactStore(str(tmp_path / "list-fail.db"))
+
+    class _Bus(ArtifactBackend):
+        async def list(self, **kw): return {"error": "bus unreachable"}
+        async def metadata(self, aid): return {"error": "artifact not found"}
+        async def get(self, aid, **kw): return {"error": "artifact not found"}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    composite = CompositeArtifactBackend(local=local, fallback=_Bus())
+    previous = harness.agent.set_backend(composite)
+    try:
+        result = await harness.call("artifact_migrate_from_bus", {"dry_run": True})
+        assert "error" in result
+        assert "dry_run" in result
+        assert result["dry_run"] is True
+    finally:
+        await composite.close()
+        await previous.close()

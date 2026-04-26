@@ -369,11 +369,9 @@ class StoreAgent(BaseAgent):
                 "read source). The bus list endpoint does not "
                 "expose a paging cursor today, so this skill "
                 "migrates at most 'limit' artifacts (capped at "
-                "100) per call — for larger corpora, run with "
-                "different filter combinations (session_id, "
-                "kind, producer aren't accepted yet but are "
-                "the planned extension surface). dry_run logs "
-                "what would happen without writing.",
+                "100) per call. Larger corpora are gated on the "
+                "bus-side cursor work (Phase 4c follow-up). "
+                "dry_run logs what would happen without writing.",
                 {
                     "limit": {
                         "type": "integer", "default": 100,
@@ -596,15 +594,19 @@ class StoreAgent(BaseAgent):
         translates into ``{error: "duplicate artifact id"}``;
         we count those as ``skipped``.
 
-        Pulls metadata in pages of ``limit`` (default 100, the
-        bus's hard cap) and uses the ``id`` of the oldest seen
-        artifact as the next page's exclusive upper bound. The
-        bus list endpoint doesn't accept a cursor today, so we
-        rely on filtering ids we've already seen — slightly
-        wasteful for very large corpora but correct and simple.
+        Single-page migration. The bus's list endpoint takes no
+        cursor, so this skill processes only the first ``limit``
+        rows (capped at the bus's ``MAX_LIST_LIMIT=100``) per
+        call. Real cursor support is a Phase 4c follow-up; until
+        then operators with corpora larger than 100 artifacts
+        re-run after each call's rows have been migrated and
+        will appear in subsequent ``list()`` results from
+        further down the queue (this assumes deletion / TTL
+        eviction surfaces older rows; otherwise migration of
+        the long tail is gated on the bus-side cursor work).
 
         Requires the agent to have a write-capable local
-        backend; ``backend=bus`` would have nowhere to copy to.
+        backend AND a bus fallback — i.e. ``backend=composite``.
         """
         try:
             limit = _int_arg(args, "limit", 100)
@@ -655,9 +657,13 @@ class StoreAgent(BaseAgent):
         # (Phase 4c follow-up).
         page = await fallback_source.list(limit=limit)
         if isinstance(page, dict):
+            # Include ``dry_run`` here too so callers see a
+            # consistent response shape on every code path,
+            # not just the success branch.
             return {
                 "copied": copied, "skipped": skipped,
                 "errors": errors, "scanned": scanned,
+                "dry_run": dry_run,
                 "error": page.get("error", "bus list failed"),
             }
         for meta in page:
@@ -835,9 +841,28 @@ async def _migrate_one(
     """Copy a single artifact from source → target.
 
     Returns ``"copied"`` / ``"skipped"`` / ``"<error string>"``.
+    Pre-flight validates required fields and skips ids already
+    present locally so dry-run counts match what a real run
+    would do.
     """
     if not aid:
         return "missing id"
+
+    kind = str(meta.get("kind") or "")
+    title = str(meta.get("title") or "")
+    if not kind:
+        return "create failed: kind is required"
+    if not title:
+        return "create failed: title is required"
+
+    # Existence check up front: a duplicate-id row will be
+    # skipped on the real run, so report it in dry-run too. The
+    # metadata round-trip is cheap (no content) and keeps
+    # ``copied`` / ``skipped`` aligned across modes.
+    existing = await target.metadata(aid)
+    if isinstance(existing, dict) and "error" not in existing:
+        return "skipped"
+
     body = await source.get(aid, offset=0, max_chars=_MIGRATION_FETCH_CAP_CHARS)
     if not isinstance(body, dict):
         # An ABC-conforming backend always returns a dict; a stub
@@ -848,14 +873,22 @@ async def _migrate_one(
         return f"fetch returned non-dict: {type(body).__name__}"
     if "error" in body:
         return f"fetch failed: {body['error']}"
+    if body.get("truncated") is True:
+        # Don't silently migrate partial content. The bus's REST
+        # surface caps reads at HARD_MAX_CHARS=20000 today; this
+        # cap could be raised in the future, but until then the
+        # migration's content fetch must NOT be truncated. Surface
+        # the truncation as a per-artifact error so the operator
+        # knows which ids need a different transport.
+        return "fetch truncated"
     text = body.get("text") or body.get("body") or ""
     if not isinstance(text, str):
         return "non-string content"
     if dry_run:
         return "copied"
     result = await target.create(
-        kind=str(meta.get("kind") or ""),
-        title=str(meta.get("title") or ""),
+        kind=kind,
+        title=title,
         content=text,
         producer=str(meta.get("producer") or ""),
         session_id=str(meta.get("session_id") or ""),

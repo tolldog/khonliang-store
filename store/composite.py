@@ -231,8 +231,18 @@ class CompositeArtifactBackend(ArtifactBackend):
             # Local side already filled the budget; no need to
             # round-trip the fallback.
             return local[:limit]
+        # Over-fetch the fallback by ``len(local)`` to compensate
+        # for rows that will be discarded as duplicates of
+        # local-side ids. Cap at 100 (the bus's MAX_LIST_LIMIT)
+        # so an oversized request doesn't blow past either the
+        # caller's budget or the bus's clamp. Worst-case the
+        # caller still sees ``limit`` unique rows; without the
+        # over-fetch a fully-overlapping fallback page could
+        # leave the merged list under-filled even when more
+        # unique rows exist further down.
+        fallback_limit = min(100, limit + len(local))
         fallback = await self._fallback.list(
-            session_id=session_id, kind=kind, producer=producer, limit=limit,
+            session_id=session_id, kind=kind, producer=producer, limit=fallback_limit,
         )
         if isinstance(fallback, dict):
             # Fallback errored; surface what we got from local

@@ -221,6 +221,42 @@ async def test_list_caps_total_at_limit():
 
 
 @pytest.mark.asyncio
+async def test_list_overfetches_fallback_to_compensate_for_dups():
+    """If the fallback's first ``limit`` rows are mostly
+    duplicates of local-side ids, the merged result could end
+    up under-filled. The composite asks the fallback for
+    ``limit + len(local)`` (capped at 100) so the dedup pass
+    has room to find unique rows.
+    """
+    local = _Recorder("local", {"list": [
+        {"id": "art_local_1"},
+        {"id": "art_local_2"},
+    ]})
+    # Fallback returns 5 rows; first 2 duplicate the local set.
+    fallback = _Recorder("fallback", {"list": [
+        {"id": "art_local_1"},  # duplicate
+        {"id": "art_local_2"},  # duplicate
+        {"id": "art_bus_3"},
+        {"id": "art_bus_4"},
+        {"id": "art_bus_5"},
+    ]})
+    composite = CompositeArtifactBackend(local=local, fallback=fallback)
+    result = await composite.list(limit=4)
+    assert isinstance(result, list)
+    ids = [item["id"] for item in result]
+    # Local rows first; fallback contributes 2 unique rows so the
+    # merged list reaches the limit of 4 (without the over-fetch
+    # we'd only see 2 + 0 = 2 if the duplicates had occupied the
+    # fallback's first ``limit`` slots).
+    assert ids == ["art_local_1", "art_local_2", "art_bus_3", "art_bus_4"]
+    # And the fallback was called with the over-fetched limit
+    # (limit=4 + len(local)=2 = 6, capped at 100).
+    fallback_call = fallback.calls[0]
+    assert fallback_call[0] == "list"
+    assert fallback_call[1]["limit"] == 6
+
+
+@pytest.mark.asyncio
 async def test_list_skips_fallback_when_local_already_filled_budget():
     """When the local side already returns ``limit`` rows, the
     composite must not waste a round trip on the bus — the
