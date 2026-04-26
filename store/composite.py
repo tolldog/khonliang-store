@@ -210,10 +210,17 @@ class CompositeArtifactBackend(ArtifactBackend):
         clipped at ``limit`` so a large fallback corpus doesn't
         blow past the caller's budget.
 
-        On a backend-side error envelope from either side, that
-        envelope passes through verbatim — masking a real
-        transport issue behind a partial result would make the
-        outage harder to diagnose than reporting the failure.
+        Error semantics differ by side:
+
+        * Local error envelope → returned verbatim. A local-side
+          failure is authoritative; substituting the fallback
+          would mask a real local issue behind whatever the bus
+          happened to know.
+        * Fallback error envelope → degraded view. The local
+          rows return as a best-effort list rather than masking
+          the local data behind a transient fallback transport
+          issue. The fallback failure surfaces in the
+          BusBackedArtifactStore log instead.
         """
         local = await self._local.list(
             session_id=session_id, kind=kind, producer=producer, limit=limit,

@@ -358,15 +358,22 @@ class StoreAgent(BaseAgent):
             Skill(
                 "artifact_migrate_from_bus",
                 "Copy artifacts from the bus's REST surface into "
-                "the local SQLite store. Walks /v1/artifacts in "
-                "pages of size limit (default 100, max 100), "
-                "preserving artifact ids so callers see the same "
-                "id under both backends. Returns "
-                "{copied, skipped, errors, scanned}. Skipped "
-                "covers ids already present locally (idempotent "
-                "re-run). Requires backend=composite or "
-                "backend=local with a bus URL configured. "
-                "dry_run logs what would happen without writing.",
+                "the local SQLite store, preserving artifact ids "
+                "so callers see the same id under both backends. "
+                "Returns {copied, skipped, errors, scanned, "
+                "dry_run}, plus an 'error' key if the bus list "
+                "request itself fails. Idempotent: ids already "
+                "present locally count as 'skipped'. Requires "
+                "backend=composite (LocalArtifactStore for the "
+                "write side + BusBackedArtifactStore for the "
+                "read source). The bus list endpoint does not "
+                "expose a paging cursor today, so this skill "
+                "migrates at most 'limit' artifacts (capped at "
+                "100) per call — for larger corpora, run with "
+                "different filter combinations (session_id, "
+                "kind, producer aren't accepted yet but are "
+                "the planned extension surface). dry_run logs "
+                "what would happen without writing.",
                 {
                     "limit": {
                         "type": "integer", "default": 100,
@@ -635,46 +642,41 @@ class StoreAgent(BaseAgent):
         skipped = 0
         errors: list[dict[str, Any]] = []
         scanned = 0
-        seen_ids: set[str] = set()
 
-        # Bound the scan loop so a misbehaving fallback (or an
-        # ever-growing corpus) can't run forever. The cap is high
-        # enough to handle realistic backlogs but low enough to
-        # keep the skill responsive.
-        for _ in range(100):
-            page = await fallback_source.list(limit=limit)
-            if isinstance(page, dict):
-                # Error envelope from the bus side; surface it
-                # rather than silently stopping.
-                return {
-                    "copied": copied, "skipped": skipped,
-                    "errors": errors, "scanned": scanned,
-                    "error": page.get("error", "bus list failed"),
-                }
-            new_in_page = [
-                meta for meta in page
-                if isinstance(meta, dict) and meta.get("id") not in seen_ids
-            ]
-            if not new_in_page:
-                # Either page is empty or every entry has already
-                # been seen this run — we've converged.
-                break
-            for meta in new_in_page:
-                aid = str(meta.get("id") or "")
-                seen_ids.add(aid)
-                scanned += 1
-                outcome = await _migrate_one(
-                    aid=aid, meta=meta,
-                    source=fallback_source,
-                    target=local_target,
-                    dry_run=dry_run,
-                )
-                if outcome == "copied":
-                    copied += 1
-                elif outcome == "skipped":
-                    skipped += 1
-                else:
-                    errors.append({"id": aid, "error": outcome})
+        # The bus's list endpoint accepts a ``limit`` but no
+        # cursor / before_id, so calling it twice with the same
+        # filter args returns the same first ``limit`` rows. A
+        # naive paging loop would spin forever (after the first
+        # page every subsequent page is "all already seen") or
+        # exit after one page either way — we just call once and
+        # honestly limit the migration to the first ``limit``
+        # rows. Operators with larger corpora re-run via filter
+        # variants once the bus's list surface grows a cursor
+        # (Phase 4c follow-up).
+        page = await fallback_source.list(limit=limit)
+        if isinstance(page, dict):
+            return {
+                "copied": copied, "skipped": skipped,
+                "errors": errors, "scanned": scanned,
+                "error": page.get("error", "bus list failed"),
+            }
+        for meta in page:
+            if not isinstance(meta, dict):
+                continue
+            aid = str(meta.get("id") or "")
+            scanned += 1
+            outcome = await _migrate_one(
+                aid=aid, meta=meta,
+                source=fallback_source,
+                target=local_target,
+                dry_run=dry_run,
+            )
+            if outcome == "copied":
+                copied += 1
+            elif outcome == "skipped":
+                skipped += 1
+            else:
+                errors.append({"id": aid, "error": outcome})
 
         return {
             "copied": copied,
@@ -837,7 +839,14 @@ async def _migrate_one(
     if not aid:
         return "missing id"
     body = await source.get(aid, offset=0, max_chars=_MIGRATION_FETCH_CAP_CHARS)
-    if isinstance(body, dict) and "error" in body:
+    if not isinstance(body, dict):
+        # An ABC-conforming backend always returns a dict; a stub
+        # or a custom backend that violates the contract would
+        # otherwise crash at ``body.get(...)``. Surface as a
+        # per-artifact error rather than letting it abort the
+        # whole migration run.
+        return f"fetch returned non-dict: {type(body).__name__}"
+    if "error" in body:
         return f"fetch failed: {body['error']}"
     text = body.get("text") or body.get("body") or ""
     if not isinstance(text, str):

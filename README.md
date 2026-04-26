@@ -15,9 +15,12 @@ Registered bus agent. Skill surface today:
 - **Write API** — `artifact_create(kind, title, content, ...)`
   — persists a new artifact via the configured backend.
 - **Migration** — `artifact_migrate_from_bus(limit, dry_run)`
-  pages through the bus's REST list and copies each artifact
-  into the local SQLite store, preserving ids. Idempotent;
-  returns `{copied, skipped, errors, scanned}`.
+  reads the bus's REST list and copies each artifact into the
+  local SQLite store, preserving ids. Idempotent; returns
+  `{copied, skipped, errors, scanned, dry_run}`, plus an
+  `error` key if the bus list request itself fails. The bus's
+  list endpoint has no cursor today, so the skill processes at
+  most `limit` artifacts (capped at 100) per call.
 - **`display(artifacts, layout='tabs')`** — lazy in-process HTTP
   viewer that pre-fetches via the same `ArtifactBackend` and
   returns a browser URL. Renderer registry extensible via
