@@ -66,10 +66,18 @@ def harness():
 
 
 @pytest.fixture
-def backend(harness):
+async def backend(harness):
+    """Swap in a FakeBackend; close the displaced default
+    ``BusBackedArtifactStore`` on teardown so its httpx client
+    doesn't leak across tests as ``ResourceWarning: unclosed
+    client``.
+    """
     fake = FakeBackend()
-    harness.agent.set_backend(fake)
-    return fake
+    previous = harness.agent.set_backend(fake)
+    try:
+        yield fake
+    finally:
+        await previous.close()
 
 
 @pytest.fixture(autouse=True)
