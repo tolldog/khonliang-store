@@ -1,20 +1,27 @@
-"""Store agent — Phase 1 scaffold + Phase 3 viewer skill.
+"""Store agent — Phase 1 scaffold + Phase 2 reads + Phase 3 viewer.
 
 Phase 1 (``fr_store_4ea7d48b``) shipped the registered-but-empty
 shell: subclass of :class:`BaseAgent`, ``agent_type = "store"``,
 install/uninstall CLI matching the developer and reviewer pattern.
-Phase 3 (``fr_store_d22556bb``) adds the first real skill,
+Phase 3 (``fr_store_d22556bb``) added the first real skill,
 ``display(artifacts)``, which lazily starts an HTTP viewer in a
 worker thread and returns a URL the caller can open in a browser.
-
-Phase 2 (artifact read skills) is intentionally still pending — the
-viewer reads artifact bytes via the bus today (see ``_fetch_via_bus``)
-so the user-facing surface ships before the read-skill migration.
+Phase 2 (``fr_store_08c1c6b2``) adds the artifact read surface:
+``artifact_get``, ``artifact_list``, ``artifact_metadata``,
+``artifact_head``, ``artifact_tail``, ``artifact_grep``,
+``artifact_excerpt``, all routed through an
+:class:`ArtifactBackend` that today proxies to the bus's REST
+surface. Phase 4 will swap in a SQLite-backed local backend
+without touching the skill surface or the viewer.
 
 Current skill surface:
     - ``health_check`` — inherited from :class:`BaseAgent`.
     - ``display(artifacts, layout='tabs')`` — lazy-start viewer,
       register tabs, return ``{url, session_id, tab_ids}``.
+    - ``artifact_get``, ``artifact_list``, ``artifact_metadata``,
+      ``artifact_head``, ``artifact_tail``, ``artifact_grep``,
+      ``artifact_excerpt`` — bus-backed reads, response shape
+      mirrors what bus emits today.
 
 Usage::
 
@@ -39,7 +46,10 @@ from typing import Any, Tuple
 
 from khonliang_bus import BaseAgent, Skill, handler
 
+from store.artifacts import ArtifactBackend, BusBackedArtifactStore
 from store.viewer import ArtifactRef, PreparedTab, display as viewer_display
+
+logger = logging.getLogger(__name__)
 
 
 # Cap on parallel artifact fetches per display() call. Tuned for
@@ -49,22 +59,151 @@ from store.viewer import ArtifactRef, PreparedTab, display as viewer_display
 # latency-bound (rather than CPU-bound) fetches don't serialize.
 _FETCH_CONCURRENCY = 8
 
+# Per-tab content cap for the viewer fetch. Sized so the renderer
+# sees the artifact body in full for any artifact under ~2 MiB —
+# orders of magnitude above the ``max_chars=4000`` token-budget
+# default the read skills use. A larger artifact will be truncated
+# at this boundary; the alternative (no cap, or a streamed body)
+# would let a single huge artifact dominate the viewer's process
+# memory, and the renderer pipeline assumes bytes-in-memory anyway.
+_VIEWER_FETCH_CAP_CHARS = 2_000_000
+
 
 class StoreAgent(BaseAgent):
     """Bus-native store agent.
 
-    Phase-1 scaffold (`fr_store_4ea7d48b`) plus Phase-3 viewer
-    surface (`fr_store_d22556bb`). Artifact read/write skills land
-    in subsequent phases; today the viewer fetches artifact bytes
-    from the bus.
+    Phase-1 scaffold (`fr_store_4ea7d48b`) plus Phase-2 reads
+    (`fr_store_08c1c6b2`) plus Phase-3 viewer surface
+    (`fr_store_d22556bb`). The read surface is backed by an
+    :class:`ArtifactBackend`; today that's a thin HTTP wrapper
+    around the bus REST routes, Phase 4 will swap in a local
+    SQLite implementation that owns the data.
     """
 
     agent_id = "store-primary"
     agent_type = "store"
     module_name = "store.agent"
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._backend: ArtifactBackend = BusBackedArtifactStore(self.bus_url)
+
+    def set_backend(self, backend: ArtifactBackend) -> ArtifactBackend:
+        """Override the backend (tests + future Phase-4 swap).
+
+        Returns the previous backend so callers that own its
+        lifecycle can close it themselves. We don't auto-close
+        because (a) tests pass in fakes that have no close()
+        anyway, and (b) doing it for the caller would force this
+        method to be async and would tangle test setup (the test
+        harness installs the backend before the event loop starts).
+        """
+        previous = self._backend
+        self._backend = backend
+        return previous
+
+    async def shutdown(self) -> None:
+        """Tear down: close the artifact backend before disconnecting.
+
+        ``BaseAgent.shutdown`` closes the WebSocket and the
+        internal httpx client; the artifact backend has its own
+        httpx client (the one that talks to the bus REST surface)
+        which we own and must close too — otherwise process exit
+        emits "unclosed client" warnings. ``ArtifactBackend.close``
+        is part of the ABC contract (default no-op for stateless
+        backends), so we can call it directly without dynamic
+        lookup or shape guessing.
+        """
+        try:
+            await self._backend.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "store backend close raised %s: %s",
+                type(exc).__name__, exc,
+            )
+        await super().shutdown()
+
     def register_skills(self) -> list[Skill]:
         return [
+            Skill(
+                "artifact_list",
+                "List artifact metadata. Filters: session_id, kind, "
+                "producer; capped by limit. Does not return content.",
+                {
+                    "session_id": {"type": "string", "default": ""},
+                    "kind": {"type": "string", "default": ""},
+                    "producer": {"type": "string", "default": ""},
+                    "limit": {"type": "integer", "default": 20},
+                },
+                since="0.4.0",
+            ),
+            Skill(
+                "artifact_metadata",
+                "Return metadata for a single artifact: size, kind, "
+                "producer, content_type, refs.",
+                {"id": {"type": "string", "required": True}},
+                since="0.4.0",
+            ),
+            Skill(
+                "artifact_get",
+                "Bounded character window from a text artifact. "
+                "Returns metadata + the slice [offset, offset+max_chars).",
+                {
+                    "id": {"type": "string", "required": True},
+                    "offset": {"type": "integer", "default": 0},
+                    "max_chars": {"type": "integer", "default": 4000},
+                },
+                since="0.4.0",
+            ),
+            Skill(
+                "artifact_head",
+                "Bounded beginning of a text artifact (line-based "
+                "with a character cap so a single huge line still "
+                "respects max_chars).",
+                {
+                    "id": {"type": "string", "required": True},
+                    "lines": {"type": "integer", "default": 80},
+                    "max_chars": {"type": "integer", "default": 4000},
+                },
+                since="0.4.0",
+            ),
+            Skill(
+                "artifact_tail",
+                "Bounded end of a text artifact.",
+                {
+                    "id": {"type": "string", "required": True},
+                    "lines": {"type": "integer", "default": 80},
+                    "max_chars": {"type": "integer", "default": 4000},
+                },
+                since="0.4.0",
+            ),
+            Skill(
+                "artifact_grep",
+                "Bounded regex/substring excerpts from a text "
+                "artifact. Returns the first max_matches hits with "
+                "context_lines of surrounding context, capped by "
+                "max_chars total.",
+                {
+                    "id": {"type": "string", "required": True},
+                    "pattern": {"type": "string", "required": True},
+                    "context_lines": {"type": "integer", "default": 10},
+                    "max_matches": {"type": "integer", "default": 10},
+                    "max_chars": {"type": "integer", "default": 4000},
+                },
+                since="0.4.0",
+            ),
+            Skill(
+                "artifact_excerpt",
+                "Bounded explicit line range from a text artifact "
+                "(1-indexed, inclusive end_line).",
+                {
+                    "id": {"type": "string", "required": True},
+                    "start_line": {"type": "integer", "required": True},
+                    "end_line": {"type": "integer", "required": True},
+                    "max_chars": {"type": "integer", "default": 4000},
+                },
+                since="0.4.0",
+            ),
             Skill(
                 "display",
                 "Open (or reuse) the in-process viewer and register "
@@ -105,6 +244,116 @@ class StoreAgent(BaseAgent):
             ),
         ]
 
+    # -- artifact read skills ---------------------------------------------
+
+    @handler("artifact_list")
+    async def handle_artifact_list(self, args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            limit = _int_arg(args, "limit", 20)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        items = await self._backend.list(
+            session_id=str(args.get("session_id") or ""),
+            kind=str(args.get("kind") or ""),
+            producer=str(args.get("producer") or ""),
+            limit=limit,
+        )
+        # Pass error envelopes through verbatim — wrapping them as
+        # {"artifacts": {"error": ...}} would let a callsite that
+        # only checks for the top-level "error" key happily render
+        # an "outage" envelope as a (corrupted) artifact list.
+        if isinstance(items, dict) and "error" in items:
+            return items
+        return {"artifacts": items}
+
+    @handler("artifact_metadata")
+    async def handle_artifact_metadata(self, args: dict[str, Any]) -> dict[str, Any]:
+        artifact_id = _required_id(args)
+        if not artifact_id:
+            return {"error": "id is required"}
+        return await self._backend.metadata(artifact_id)
+
+    @handler("artifact_get")
+    async def handle_artifact_get(self, args: dict[str, Any]) -> dict[str, Any]:
+        artifact_id = _required_id(args)
+        if not artifact_id:
+            return {"error": "id is required"}
+        try:
+            offset = _int_arg(args, "offset", 0)
+            max_chars = _int_arg(args, "max_chars", 4000)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return await self._backend.get(
+            artifact_id, offset=offset, max_chars=max_chars,
+        )
+
+    @handler("artifact_head")
+    async def handle_artifact_head(self, args: dict[str, Any]) -> dict[str, Any]:
+        artifact_id = _required_id(args)
+        if not artifact_id:
+            return {"error": "id is required"}
+        try:
+            lines = _int_arg(args, "lines", 80)
+            max_chars = _int_arg(args, "max_chars", 4000)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return await self._backend.head(
+            artifact_id, lines=lines, max_chars=max_chars,
+        )
+
+    @handler("artifact_tail")
+    async def handle_artifact_tail(self, args: dict[str, Any]) -> dict[str, Any]:
+        artifact_id = _required_id(args)
+        if not artifact_id:
+            return {"error": "id is required"}
+        try:
+            lines = _int_arg(args, "lines", 80)
+            max_chars = _int_arg(args, "max_chars", 4000)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return await self._backend.tail(
+            artifact_id, lines=lines, max_chars=max_chars,
+        )
+
+    @handler("artifact_grep")
+    async def handle_artifact_grep(self, args: dict[str, Any]) -> dict[str, Any]:
+        artifact_id = _required_id(args)
+        if not artifact_id:
+            return {"error": "id is required"}
+        pattern = str(args.get("pattern") or "")
+        if not pattern:
+            return {"error": "pattern is required"}
+        try:
+            context_lines = _int_arg(args, "context_lines", 10)
+            max_matches = _int_arg(args, "max_matches", 10)
+            max_chars = _int_arg(args, "max_chars", 4000)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return await self._backend.grep(
+            artifact_id,
+            pattern=pattern,
+            context_lines=context_lines,
+            max_matches=max_matches,
+            max_chars=max_chars,
+        )
+
+    @handler("artifact_excerpt")
+    async def handle_artifact_excerpt(self, args: dict[str, Any]) -> dict[str, Any]:
+        artifact_id = _required_id(args)
+        if not artifact_id:
+            return {"error": "id is required"}
+        try:
+            start = _required_int(args, "start_line")
+            end = _required_int(args, "end_line")
+            max_chars = _int_arg(args, "max_chars", 4000)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return await self._backend.excerpt(
+            artifact_id, start_line=start, end_line=end, max_chars=max_chars,
+        )
+
+    # -- display ----------------------------------------------------------
+
     @handler("display")
     async def handle_display(self, args: dict[str, Any]) -> dict[str, Any]:
         raw = args.get("artifacts")
@@ -135,7 +384,7 @@ class StoreAgent(BaseAgent):
         async def _fetch_one(ref: ArtifactRef) -> PreparedTab:
             async with sem:
                 try:
-                    content_type, body, metadata = await self._fetch_via_bus(ref.id)
+                    content_type, body, metadata = await self._fetch_for_viewer(ref.id)
                 except Exception as exc:  # noqa: BLE001
                     content_type = "text/plain"
                     body = (
@@ -166,27 +415,40 @@ class StoreAgent(BaseAgent):
             return {"error": f"viewer display failed: {exc}"}
         return result
 
-    async def _fetch_via_bus(
+    async def _fetch_for_viewer(
         self, artifact_id: str
     ) -> Tuple[str, bytes, dict[str, Any]]:
-        """Resolve an artifact for the renderer via the bus.
+        """Resolve an artifact for the renderer via the backend.
 
-        Phase 4 will swap this to a local read against the store's
-        own backend once write-ownership migrates. The renderer /
-        server / state modules don't see the read path either way.
+        Goes through ``self._backend`` directly rather than
+        round-tripping through the bus — the viewer runs inside
+        the store agent process, so an in-process call is the
+        correct path. Phase 4 swaps ``self._backend`` for a local
+        SQLite implementation without touching this method.
         """
-        result = await self.request(
-            agent_type="bus",
-            operation="artifact_get",
-            args={"id": artifact_id},
+        # Cap the body at :data:`_VIEWER_FETCH_CAP_CHARS`. Sized so
+        # any artifact under ~2 MiB renders in full; larger
+        # artifacts are truncated at the cap (the renderer
+        # pipeline holds bytes-in-memory, so unbounded fetches
+        # would let a single huge artifact dominate the viewer's
+        # process memory).
+        payload = await self._backend.get(
+            artifact_id,
+            offset=0,
+            max_chars=_VIEWER_FETCH_CAP_CHARS,
         )
-        payload = (result and result.get("result")) or {}
         if not isinstance(payload, dict):
             raise RuntimeError(
-                f"bus.artifact_get returned non-dict: {type(payload).__name__}"
+                f"backend.get returned non-dict: {type(payload).__name__}"
             )
+        if "error" in payload:
+            raise RuntimeError(payload["error"])
         body_text = payload.get("text") or payload.get("body") or ""
-        body = body_text.encode("utf-8") if isinstance(body_text, str) else bytes(body_text)
+        body = (
+            body_text.encode("utf-8")
+            if isinstance(body_text, str)
+            else bytes(body_text)
+        )
         meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
         content_type = (
             meta.get("content_type")
@@ -194,6 +456,72 @@ class StoreAgent(BaseAgent):
             or "text/plain"
         )
         return content_type, body, dict(meta)
+
+
+def _required_id(args: dict[str, Any]) -> str:
+    """Pull and trim the ``id`` arg; empty / missing returns ''."""
+    return str(args.get("id") or "").strip()
+
+
+def _coerce_int(name: str, value: Any) -> int:
+    """Coerce a non-empty value to int with the project's strict policy.
+
+    Reject:
+
+    * ``bool`` — ``True``/``False`` would silently become 1/0
+      because ``bool`` is a subclass of ``int`` in Python.
+    * Non-integer floats (``1.9`` would silently truncate to ``1``
+      via ``int()`` and change the request — different from what
+      the caller asked for).
+
+    Accept integer-valued floats (``1.0`` → ``1``) since JSON
+    can serialize ``1`` as either ``1`` or ``1.0`` depending on
+    the encoder; treating them as equivalent is friendlier than
+    rejecting a wire-format quirk. String-typed numerics
+    (``"100"``) coerce normally.
+
+    Raises ``ValueError`` with a per-arg message on any other
+    shape; the caller wraps it in an ``{"error": ...}`` envelope.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"{name} must be an integer")
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+
+
+def _int_arg(args: dict[str, Any], name: str, default: int) -> int:
+    """Coerce ``args[name]`` to int.
+
+    Missing / empty values fall back to ``default``. Provided
+    values pass through :func:`_coerce_int` for the bool / non-
+    integer-float / non-numeric rejection policy. Silently
+    swallowing junk input would change request semantics (e.g.
+    ``offset='abc'`` becoming ``offset=0``) and is exactly the
+    kind of corruption that's hard to debug after the fact.
+    """
+    value = args.get(name)
+    if value is None or value == "":
+        return default
+    return _coerce_int(name, value)
+
+
+def _required_int(args: dict[str, Any], name: str) -> int:
+    """Like :func:`_int_arg` but with no default — missing is an error.
+
+    Used for required positional integers (``start_line`` /
+    ``end_line``) where falling back to a default would change the
+    request rather than fail loudly.
+    """
+    value = args.get(name)
+    if value is None or value == "":
+        raise ValueError(f"{name} is required")
+    return _coerce_int(name, value)
 
 
 def _parse_artifact_refs(raw: Any) -> list[ArtifactRef]:

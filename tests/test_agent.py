@@ -1,25 +1,87 @@
 """Tests for StoreAgent using the bus-lib testing harness.
 
-Phase 1 (scaffold) shipped first; Phase 3 (viewer) added the
-``display`` skill. health_check is still inherited from
-:class:`BaseAgent`. This module covers registration shape, the
-handler argument-parsing, and end-to-end ``display`` happy path
-with a stubbed bus fetch.
+Phase 1 (scaffold) → Phase 3 (viewer) → Phase 2 (artifact reads).
+This module covers skill registration, handler argument-parsing,
+the new artifact_* read handlers, and end-to-end ``display``
+happy path with a stubbed backend.
 """
 
 from __future__ import annotations
+
+from typing import Any, Optional
 
 import pytest
 from khonliang_bus.testing import AgentTestHarness
 
 from store.agent import StoreAgent, _parse_artifact_refs
+from store.artifacts import ArtifactBackend, ListResult
 from store.viewer import ArtifactRef
 from store.viewer import server as viewer_server
+
+
+class FakeBackend(ArtifactBackend):
+    """Test backend: returns canned values; records every call.
+
+    Each method records ``(name, kwargs)`` into ``self.calls``;
+    behavior knobs override individual responses (or raise to
+    exercise error paths).
+    """
+
+    def __init__(self, response: Any = None) -> None:
+        self.response = response
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.exc: Optional[BaseException] = None
+
+    def _record(self, op: str, **kwargs: Any) -> Any:
+        self.calls.append((op, kwargs))
+        if self.exc is not None:
+            raise self.exc
+        return self.response
+
+    async def list(self, **kwargs: Any) -> ListResult:
+        # Annotation matches ``ArtifactBackend.list``: real
+        # backends can return either the list of metadata dicts
+        # or a single error-envelope dict on transport failure,
+        # and the tests exercise both shapes.
+        return self._record("list", **kwargs)
+
+    async def metadata(self, artifact_id: str) -> dict[str, Any]:
+        return self._record("metadata", id=artifact_id)
+
+    async def get(self, artifact_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._record("get", id=artifact_id, **kwargs)
+
+    async def head(self, artifact_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._record("head", id=artifact_id, **kwargs)
+
+    async def tail(self, artifact_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._record("tail", id=artifact_id, **kwargs)
+
+    async def grep(self, artifact_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._record("grep", id=artifact_id, **kwargs)
+
+    async def excerpt(self, artifact_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._record("excerpt", id=artifact_id, **kwargs)
 
 
 @pytest.fixture
 def harness():
     return AgentTestHarness(StoreAgent)
+
+
+@pytest.fixture
+async def backend(harness):
+    """Swap in a FakeBackend; close the displaced default
+    ``BusBackedArtifactStore`` on teardown so its httpx client
+    doesn't leak across tests as ``ResourceWarning: unclosed
+    client``.
+    """
+    fake = FakeBackend()
+    previous = harness.agent.set_backend(fake)
+    try:
+        yield fake
+    finally:
+        await previous.close()
 
 
 @pytest.fixture(autouse=True)
@@ -109,18 +171,11 @@ def test_parse_artifact_refs_rejects_object_without_id():
 
 
 @pytest.mark.asyncio
-async def test_display_handler_returns_url_session_and_tab_ids(harness):
-    async def fake_request(*, agent_type, operation, args, **kwargs):
-        assert agent_type == "bus"
-        assert operation == "artifact_get"
-        return {
-            "result": {
-                "text": "# Hello\n\nbody",
-                "metadata": {"content_type": "text/markdown"},
-            },
-        }
-
-    harness.agent.request = fake_request
+async def test_display_handler_returns_url_session_and_tab_ids(harness, backend):
+    backend.response = {
+        "text": "# Hello\n\nbody",
+        "metadata": {"content_type": "text/markdown"},
+    }
     result = await harness.call("display", {
         "artifacts": '["art_aaa"]',
         "layout": "tabs",
@@ -129,6 +184,18 @@ async def test_display_handler_returns_url_session_and_tab_ids(harness):
     assert result["session_id"]
     assert result["url"].endswith(f"/view/{result['session_id']}")
     assert len(result["tab_ids"]) == 1
+    # Display routes through the backend in-process — no bus
+    # round-trip — and asks for a viewer-sized window (well above
+    # the read skills' 4000-char token-budget default) so a
+    # normal-sized artifact renders in full. Asserting the cap is
+    # "large" rather than the exact value lets us tune the
+    # constant without churning this test.
+    assert len(backend.calls) == 1
+    op, kwargs = backend.calls[0]
+    assert op == "get"
+    assert kwargs["id"] == "art_aaa"
+    assert kwargs["offset"] == 0
+    assert kwargs["max_chars"] >= 1_000_000
 
 
 @pytest.mark.asyncio
@@ -155,11 +222,8 @@ async def test_display_handler_requires_artifacts(harness):
 
 
 @pytest.mark.asyncio
-async def test_display_handler_records_inline_error_on_fetch_failure(harness):
-    async def boom(*, agent_type, operation, args, **kwargs):
-        raise RuntimeError("bus down")
-
-    harness.agent.request = boom
+async def test_display_handler_records_inline_error_on_fetch_failure(harness, backend):
+    backend.exc = RuntimeError("bus down")
     result = await harness.call("display", {
         "artifacts": '["art_aaa"]',
     })
@@ -176,3 +240,319 @@ async def test_display_handler_records_inline_error_on_fetch_failure(harness):
     only_tab = tabs[0]
     assert b"Failed to fetch artifact art_aaa" in only_tab.body
     assert only_tab.metadata.get("fetch_error") is True
+
+
+@pytest.mark.asyncio
+async def test_display_handler_inlines_error_on_backend_error_envelope(harness, backend):
+    """If the backend returns an error-envelope dict (rather than
+    raising), the viewer must still treat it as a fetch failure
+    and not silently render an empty tab.
+    """
+    backend.response = {"error": "artifact not found"}
+    result = await harness.call("display", {"artifacts": '["art_missing"]'})
+    assert "error" not in result
+    server = viewer_server._SERVER
+    assert server is not None
+    snap = server.registry.session_snapshot(result["session_id"])
+    assert snap is not None
+    _, tabs = snap
+    only_tab = tabs[0]
+    assert b"Failed to fetch artifact art_missing" in only_tab.body
+    assert b"artifact not found" in only_tab.body
+
+
+# -- artifact read skill registrations ----------------------------------------
+
+
+def test_advertises_all_phase2_read_skills(harness):
+    """All seven read skills + display + health_check live on the
+    skill list; if a handler-vs-skill drift is introduced the
+    set-symmetry test below also catches it.
+    """
+    skill_names = {s["name"] for s in harness.registration.skills}
+    expected = {
+        "artifact_list", "artifact_metadata", "artifact_get",
+        "artifact_head", "artifact_tail", "artifact_grep",
+        "artifact_excerpt", "display",
+    }
+    assert expected.issubset(skill_names)
+
+
+# -- artifact_list ------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_artifact_list_threads_filters(harness, backend):
+    backend.response = [{"id": "art_a"}, {"id": "art_b"}]
+    result = await harness.call("artifact_list", {
+        "session_id": "s1", "kind": "tool_result", "producer": "dev", "limit": 5,
+    })
+    assert result == {"artifacts": [{"id": "art_a"}, {"id": "art_b"}]}
+    assert backend.calls == [(
+        "list",
+        {"session_id": "s1", "kind": "tool_result", "producer": "dev", "limit": 5},
+    )]
+
+
+@pytest.mark.asyncio
+async def test_artifact_list_uses_defaults_when_args_missing(harness, backend):
+    backend.response = []
+    await harness.call("artifact_list", {})
+    op, kwargs = backend.calls[0]
+    assert op == "list"
+    assert kwargs["limit"] == 20
+    assert kwargs["session_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_artifact_list_passes_error_envelope_through(harness, backend):
+    """Backend can emit an error envelope (`{'error': ...}`) on
+    network/5xx; the handler must pass it through unwrapped, the
+    same way the other read skills do, so callers that check
+    ``result.get('error')`` see the failure rather than a
+    corrupted ``{'artifacts': {'error': ...}}`` shape.
+    """
+    backend.response = {"error": "bus returned HTTP 500"}
+    result = await harness.call("artifact_list", {})
+    assert result == {"error": "bus returned HTTP 500"}
+
+
+# -- artifact_metadata --------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_artifact_metadata_pulls_id_through(harness, backend):
+    backend.response = {"id": "art_a", "size_bytes": 42}
+    result = await harness.call("artifact_metadata", {"id": "art_a"})
+    assert result == {"id": "art_a", "size_bytes": 42}
+    assert backend.calls == [("metadata", {"id": "art_a"})]
+
+
+@pytest.mark.asyncio
+async def test_artifact_metadata_rejects_missing_id(harness, backend):
+    result = await harness.call("artifact_metadata", {})
+    assert result == {"error": "id is required"}
+    assert backend.calls == []
+
+
+# -- artifact_get -------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_artifact_get_threads_offset_and_max_chars(harness, backend):
+    backend.response = {"text": "hello"}
+    await harness.call("artifact_get", {"id": "art_a", "offset": 50, "max_chars": 200})
+    assert backend.calls == [(
+        "get",
+        {"id": "art_a", "offset": 50, "max_chars": 200},
+    )]
+
+
+@pytest.mark.asyncio
+async def test_artifact_get_coerces_string_numerics(harness, backend):
+    """Bus clients sometimes pass numeric args as strings (JSON
+    payload origin); the handler should coerce rather than reject.
+    """
+    backend.response = {"text": ""}
+    await harness.call("artifact_get", {"id": "art_a", "offset": "100", "max_chars": "50"})
+    op, kwargs = backend.calls[0]
+    assert kwargs == {"id": "art_a", "offset": 100, "max_chars": 50}
+
+
+@pytest.mark.asyncio
+async def test_artifact_get_rejects_bad_offset(harness, backend):
+    """Provided-but-non-numeric ints are an explicit error rather
+    than a silent fallback to default. Silent fallback would mean
+    ``offset='abc'`` becomes ``offset=0`` and starts returning
+    different content than the caller asked for.
+    """
+    result = await harness.call("artifact_get", {"id": "art_a", "offset": "abc"})
+    assert result == {"error": "offset must be an integer"}
+    assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_artifact_grep_rejects_bad_max_chars(harness, backend):
+    result = await harness.call("artifact_grep", {
+        "id": "art_a", "pattern": "needle", "max_chars": "wat",
+    })
+    assert result == {"error": "max_chars must be an integer"}
+    assert backend.calls == []
+
+
+# -- artifact_head / tail -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_artifact_head_and_tail(harness, backend):
+    backend.response = {"text": ""}
+    await harness.call("artifact_head", {"id": "art_a", "lines": 10})
+    await harness.call("artifact_tail", {"id": "art_a", "lines": 5, "max_chars": 100})
+    assert backend.calls[0] == ("head", {"id": "art_a", "lines": 10, "max_chars": 4000})
+    assert backend.calls[1] == ("tail", {"id": "art_a", "lines": 5, "max_chars": 100})
+
+
+# -- artifact_grep ------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_artifact_grep_requires_pattern(harness, backend):
+    result = await harness.call("artifact_grep", {"id": "art_a"})
+    assert result == {"error": "pattern is required"}
+    assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_artifact_grep_threads_caps(harness, backend):
+    backend.response = {"matches": []}
+    await harness.call("artifact_grep", {
+        "id": "art_a", "pattern": "needle",
+        "context_lines": 3, "max_matches": 5, "max_chars": 1000,
+    })
+    assert backend.calls == [(
+        "grep",
+        {"id": "art_a", "pattern": "needle", "context_lines": 3, "max_matches": 5, "max_chars": 1000},
+    )]
+
+
+# -- artifact_excerpt ---------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_artifact_excerpt_requires_line_range(harness, backend):
+    result = await harness.call("artifact_excerpt", {"id": "art_a", "start_line": 5})
+    # Names the missing arg explicitly rather than the previous
+    # combined "start_line and end_line are required" message —
+    # easier to debug when only one is missing.
+    assert result == {"error": "end_line is required"}
+    assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_artifact_excerpt_rejects_non_integer_lines(harness, backend):
+    result = await harness.call("artifact_excerpt", {
+        "id": "art_a", "start_line": "abc", "end_line": 25,
+    })
+    assert result == {"error": "start_line must be an integer"}
+    assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_int_args_reject_booleans(harness, backend):
+    """``bool`` is a subclass of ``int`` in Python, so a JSON
+    client typo (e.g., ``max_chars: true``) would otherwise
+    silently coerce to ``max_chars=1`` and return very different
+    content than the caller intended. Reject explicitly.
+    """
+    for op, args in [
+        ("artifact_get", {"id": "art_a", "max_chars": True}),
+        ("artifact_head", {"id": "art_a", "lines": False}),
+        ("artifact_excerpt", {"id": "art_a", "start_line": True, "end_line": 10}),
+    ]:
+        result = await harness.call(op, args)
+        assert "must be an integer" in result.get("error", ""), (
+            f"{op} accepted a boolean: {result}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_int_args_reject_non_integer_floats(harness, backend):
+    """``int(1.9)`` returns ``1`` silently, so ``offset=1.9`` would
+    quietly become ``offset=1`` instead of erroring. Reject any
+    float whose ``is_integer()`` is false.
+    """
+    result = await harness.call("artifact_get", {"id": "art_a", "offset": 1.9})
+    assert result == {"error": "offset must be an integer"}
+    assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_int_args_accept_integer_valued_floats(harness, backend):
+    """JSON encoders can serialize ``1`` as ``1.0``; treating
+    integer-valued floats as equivalent is friendlier than
+    rejecting a wire-format quirk. ``1.5`` still gets rejected
+    by the test above.
+    """
+    backend.response = {"text": ""}
+    await harness.call("artifact_get", {"id": "art_a", "offset": 100.0})
+    op, kwargs = backend.calls[0]
+    assert kwargs["offset"] == 100
+    assert isinstance(kwargs["offset"], int)
+
+
+@pytest.mark.asyncio
+async def test_artifact_excerpt_threads_line_range(harness, backend):
+    backend.response = {"lines": []}
+    await harness.call("artifact_excerpt", {
+        "id": "art_a", "start_line": 10, "end_line": 25, "max_chars": 500,
+    })
+    assert backend.calls == [(
+        "excerpt",
+        {"id": "art_a", "start_line": 10, "end_line": 25, "max_chars": 500},
+    )]
+
+
+# -- error envelope passthrough -----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_skills_pass_through_backend_error_envelope(harness, backend):
+    """When the backend returns ``{'error': ...}`` (e.g. 404 from
+    bus or non-JSON response) the handler must surface it
+    verbatim, not swallow it. Lets MCP / bus clients treat it
+    the same way they'd handle a direct bus.artifact_metadata
+    error envelope.
+    """
+    backend.response = {"error": "artifact not found"}
+    result = await harness.call("artifact_metadata", {"id": "art_missing"})
+    assert result == {"error": "artifact not found"}
+
+
+# -- backend lifecycle --------------------------------------------------------
+
+
+def test_set_backend_returns_previous(harness):
+    """Caller can recover the previous backend and dispose of it
+    on its own schedule (we deliberately don't auto-close).
+    """
+    initial = harness.agent._backend
+    fake = FakeBackend()
+    returned = harness.agent.set_backend(fake)
+    assert returned is initial
+    assert harness.agent._backend is fake
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_owned_backend(harness):
+    """``BusBackedArtifactStore`` owns an httpx client; shutdown
+    must close it so the process doesn't emit unclosed-client
+    warnings on exit.
+    """
+    closed = {"flag": False}
+
+    class CloseRecording(FakeBackend):
+        async def close(self) -> None:  # type: ignore[override]
+            closed["flag"] = True
+
+    harness.agent.set_backend(CloseRecording())
+    # BaseAgent.shutdown disconnects the websocket and closes
+    # internal state. The harness leaves the connector unstarted
+    # so we patch _connector to None to make shutdown a no-op
+    # apart from the backend close path under test.
+    harness.agent._connector = None
+    await harness.agent.shutdown()
+    assert closed["flag"] is True
+
+
+@pytest.mark.asyncio
+async def test_shutdown_swallows_backend_close_errors(harness, caplog):
+    """A backend.close() raising shouldn't take down agent
+    shutdown — the rest of the teardown still needs to run.
+    """
+    class RaiseOnClose(FakeBackend):
+        async def close(self) -> None:  # type: ignore[override]
+            raise RuntimeError("backend wedged")
+
+    harness.agent.set_backend(RaiseOnClose())
+    harness.agent._connector = None
+    await harness.agent.shutdown()  # must not raise

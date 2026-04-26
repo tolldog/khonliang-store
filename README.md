@@ -4,32 +4,39 @@ Bus-native store agent. Target eventual owner of the artifact backend
 (currently served by the bus's `bus_artifact_*` MCP surface) and host
 of a browser-based viewer mode for rendered artifacts.
 
-## Status — Phase 3 viewer landed; artifact-ownership migration follows
+## Status — Phase 2 reads + Phase 3 viewer landed; write-ownership migration follows
 
-Registered bus agent with one real skill: `display(artifacts,
-layout='tabs')`. Lazily starts an in-process HTTP viewer on first
-call, pre-fetches the listed artifacts via the bus, and returns a
-URL the caller can open in a browser. The viewer renders by
-content_type — markdown via marked.js (CDN), JSON pretty-printed
-with click-to-collapse, graphviz via local `dot -Tsvg`, common code
-MIME types via prism.js (CDN), and a `<pre>` fallback for unknown
-types. The renderer registry is the explicit extension hook: new
-file types extend via `@register_renderer("type/x")`.
+Registered bus agent. Skill surface today:
 
-Tracked under `fr_store_d22556bb`. The Phase-1 scaffold under
-`fr_store_4ea7d48b` is also complete.
+- **Read API** — `artifact_list`, `artifact_metadata`,
+  `artifact_get`, `artifact_head`, `artifact_tail`,
+  `artifact_grep`, `artifact_excerpt`. All seven route through
+  an `ArtifactBackend` abstraction. The shipped backend is
+  `BusBackedArtifactStore`, an HTTP client against the bus's
+  REST routes (where data still lives). Phase 4 swaps in a
+  local SQLite backend without changing the skill surface.
+- **`display(artifacts, layout='tabs')`** — lazy in-process HTTP
+  viewer that pre-fetches via the same `ArtifactBackend`
+  (in-process call, no bus round-trip), and returns a browser
+  URL. Renderers cover markdown (marked.js CDN), JSON
+  (click-to-collapse), graphviz (local `dot -Tsvg` rendered via
+  base64-data `<img>`), prism.js code highlighting, and a `<pre>`
+  fallback. Extensible via `@register_renderer("type/x")`.
+
+Tracked under `fr_store_08c1c6b2` (reads) and `fr_store_d22556bb`
+(viewer). Phase-1 scaffold under `fr_store_4ea7d48b` is complete.
 
 ## Phase status
 
 - **Phase 1 — scaffold** ✅ shipped (PR #1).
-- **Phase 2 — artifact read skills** (`get`, `list`, `metadata`,
-  `head`, `tail`, `grep`, `excerpt`) — _open_. The viewer reads
-  artifacts via the bus today; this phase moves ownership of reads
-  into the store.
+- **Phase 2 — artifact read skills** ✅ shipped. `ArtifactBackend`
+  ABC + `BusBackedArtifactStore` HTTP backend; viewer fetch path
+  goes through the same backend in-process.
 - **Phase 3 — viewer mode** ✅ shipped (PR #2).
 - **Phase 4 — artifact write skills + migration**
-  (`stage_payload`, `replace`, `delete`) — _open_. Once writes move,
-  the bus artifact surface becomes a read-proxy or is removed.
+  (`stage_payload`, `replace`, `delete`) — _open_. Local SQLite
+  backend replaces `BusBackedArtifactStore`; bus's artifact REST
+  surface becomes a read-proxy or is removed.
 - **Phase 5 — researcher integration** — _open_. Wires
   `fr_researcher_000ad07c`'s `stage_payload` / `ingest_from_artifact`
   through the store once writes land.
