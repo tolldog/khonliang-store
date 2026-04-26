@@ -221,6 +221,86 @@ async def test_list_caps_total_at_limit():
 
 
 @pytest.mark.asyncio
+async def test_list_clamps_limit_to_max_list_limit():
+    """Caller-supplied limit > MAX_LIST_LIMIT must clamp,
+    matching the underlying backends' policy. The composite
+    used to forward the raw value; ``local[:limit]`` would
+    still work but ``len(local) >= limit`` could short-circuit
+    incorrectly.
+    """
+    from store.local_store import MAX_LIST_LIMIT
+    local = _Recorder("local", {"list": [{"id": f"art_{i}"} for i in range(5)]})
+    fallback = _Recorder("fallback", {"list": []})
+    composite = CompositeArtifactBackend(local=local, fallback=fallback)
+    await composite.list(limit=MAX_LIST_LIMIT * 10)
+    # Local was called with the clamped value, not the raw one.
+    assert local.calls[0][1]["limit"] == MAX_LIST_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_list_with_zero_limit_short_circuits():
+    """``limit=0`` returns ``[]`` without round-tripping either
+    backend. Matches LocalArtifactStore's policy: "is anything
+    matching?" answer is empty, not a one-row best effort.
+    """
+    local = _Recorder("local", {"list": [{"id": "art_a"}]})
+    fallback = _Recorder("fallback", {"list": [{"id": "art_b"}]})
+    composite = CompositeArtifactBackend(local=local, fallback=fallback)
+    result = await composite.list(limit=0)
+    assert result == []
+    assert local.calls == []
+    assert fallback.calls == []
+
+
+@pytest.mark.asyncio
+async def test_list_with_negative_limit_collapses_to_empty():
+    """Negative limit used to slip through and produce
+    ``local[:negative]`` (an end-trimmed slice). Clamp makes
+    that an empty list, consistent with the limit=0 case.
+    """
+    local = _Recorder("local", {"list": [{"id": "art_a"}]})
+    fallback = _Recorder("fallback", {"list": []})
+    composite = CompositeArtifactBackend(local=local, fallback=fallback)
+    result = await composite.list(limit=-1)
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_list_dedups_within_fallback_page():
+    """If the fallback's own page contains duplicates of an id
+    not on the local side, both copies must NOT be appended.
+    The merge loop now updates ``seen_ids`` as it goes.
+    """
+    local = _Recorder("local", {"list": []})
+    fallback = _Recorder("fallback", {"list": [
+        {"id": "art_dup"},
+        {"id": "art_dup"},  # duplicate within the fallback page
+        {"id": "art_x"},
+    ]})
+    composite = CompositeArtifactBackend(local=local, fallback=fallback)
+    result = await composite.list(limit=10)
+    ids = [item["id"] for item in result]
+    assert ids == ["art_dup", "art_x"]
+
+
+@pytest.mark.asyncio
+async def test_list_skips_fallback_rows_with_missing_id():
+    """A fallback row with a missing/empty id can't participate
+    in dedup and shouldn't quietly leak into the result. Skip it.
+    """
+    local = _Recorder("local", {"list": []})
+    fallback = _Recorder("fallback", {"list": [
+        {"id": ""},
+        {"id": "art_real"},
+        {"title": "no-id"},
+    ]})
+    composite = CompositeArtifactBackend(local=local, fallback=fallback)
+    result = await composite.list(limit=10)
+    ids = [item["id"] for item in result]
+    assert ids == ["art_real"]
+
+
+@pytest.mark.asyncio
 async def test_list_overfetches_fallback_to_compensate_for_dups():
     """If the fallback's first ``limit`` rows are mostly
     duplicates of local-side ids, the merged result could end

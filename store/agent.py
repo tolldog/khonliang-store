@@ -623,7 +623,14 @@ class StoreAgent(BaseAgent):
 
         local_target, fallback_source = _migration_endpoints(self._backend)
         if local_target is None:
+            # Maintain the standard response shape on
+            # misconfiguration paths so callers can rely on
+            # consistent keys regardless of whether the run
+            # succeeded, partially failed, or never started.
             return {
+                "copied": 0, "skipped": 0,
+                "errors": [], "scanned": 0,
+                "dry_run": dry_run,
                 "error": (
                     "artifact_migrate_from_bus requires a local backend; "
                     "current backend is read-only"
@@ -634,6 +641,9 @@ class StoreAgent(BaseAgent):
             # nothing to copy from. Surface the misconfiguration
             # explicitly rather than silently reporting 0 copied.
             return {
+                "copied": 0, "skipped": 0,
+                "errors": [], "scanned": 0,
+                "dry_run": dry_run,
                 "error": (
                     "no bus fallback configured; set backend=composite "
                     "to enable migration"

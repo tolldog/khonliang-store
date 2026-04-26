@@ -239,6 +239,15 @@ class CompositeArtifactBackend(ArtifactBackend):
           issue. The fallback failure surfaces in the
           BusBackedArtifactStore log instead.
         """
+        # Clamp ``limit`` to ``[0, MAX_LIST_LIMIT]`` to mirror the
+        # underlying backends' policy, and to avoid surprises:
+        # negative ``limit`` would otherwise turn ``local[:limit]``
+        # into an end-trimmed slice (Python list semantics) and
+        # ``len(local) >= limit`` could short-circuit incorrectly.
+        # ``limit=0`` collapses to an empty list immediately.
+        limit = max(0, min(int(limit), MAX_LIST_LIMIT))
+        if limit == 0:
+            return []
         local = await self._local.list(
             session_id=session_id, kind=kind, producer=producer, limit=limit,
         )
@@ -277,8 +286,18 @@ class CompositeArtifactBackend(ArtifactBackend):
         for item in fallback:
             if not isinstance(item, dict):
                 continue
-            if item.get("id") in seen_ids:
+            item_id = item.get("id")
+            if not item_id:
+                # Skip rows with a missing/empty id — they can't
+                # participate in dedup and a caller that needs
+                # them can hit the fallback directly.
                 continue
+            if item_id in seen_ids:
+                continue
+            # Update ``seen_ids`` as we go so a fallback page
+            # that contains its own duplicates doesn't append
+            # the same id twice.
+            seen_ids.add(item_id)
             merged.append(item)
             if len(merged) >= limit:
                 break

@@ -735,19 +735,27 @@ def test_build_backend_composite_pairs_local_and_bus(tmp_path):
 async def test_migrate_requires_local_target(harness, backend):
     """The default ``BusBackedArtifactStore`` (read-only) has
     nowhere to copy *to*. The handler must surface that as a
-    clear error rather than silently doing nothing.
+    clear error rather than silently doing nothing, AND keep
+    the standard response shape so callers see consistent
+    keys regardless of which path the run took.
     """
     # FakeBackend has no migration endpoints (not Local nor Composite).
     result = await harness.call("artifact_migrate_from_bus", {})
     assert "error" in result
     assert "local backend" in result["error"]
+    # Standard response keys are present even on the
+    # misconfiguration path.
+    for key in ("copied", "skipped", "errors", "scanned", "dry_run"):
+        assert key in result, f"missing {key!r} in {result}"
+    assert result["copied"] == 0
+    assert result["scanned"] == 0
 
 
 @pytest.mark.asyncio
 async def test_migrate_requires_bus_fallback(harness, tmp_path):
     """``backend=local`` (no fallback) is similarly stuck —
     nothing to migrate from. Operator should switch to
-    ``backend=composite``.
+    ``backend=composite``. Response shape stays consistent.
     """
     from store.local_store import LocalArtifactStore
 
@@ -757,6 +765,8 @@ async def test_migrate_requires_bus_fallback(harness, tmp_path):
         result = await harness.call("artifact_migrate_from_bus", {})
         assert "error" in result
         assert "composite" in result["error"]
+        for key in ("copied", "skipped", "errors", "scanned", "dry_run"):
+            assert key in result
     finally:
         await local.close()
         await previous.close()
