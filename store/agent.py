@@ -610,6 +610,7 @@ class StoreAgent(BaseAgent):
         """
         try:
             limit = _int_arg(args, "limit", 100)
+            dry_run = _bool_arg(args, "dry_run", False)
         except ValueError as exc:
             return {"error": str(exc)}
         # Cap at 100 to match the bus's MAX_LIST_LIMIT — asking
@@ -619,7 +620,6 @@ class StoreAgent(BaseAgent):
             limit = 1
         if limit > 100:
             limit = 100
-        dry_run = bool(args.get("dry_run"))
 
         local_target, fallback_source = _migration_endpoints(self._backend)
         if local_target is None:
@@ -803,18 +803,19 @@ def _migration_endpoints(
 ) -> Tuple[Optional[ArtifactBackend], Optional[ArtifactBackend]]:
     """Pick out (local_target, fallback_source) from the live backend.
 
-    For ``backend=composite`` both halves are reachable directly;
-    for ``backend=local`` we don't have a bus fallback in the
-    backend object, so the caller must surface a misconfiguration
-    error. ``backend=bus`` has no local target — also a
-    misconfiguration for the migration skill.
+    For ``backend=composite`` both halves are reachable via the
+    public ``local`` / ``fallback`` accessors so the migration
+    doesn't depend on private attribute names. ``backend=local``
+    has no fallback (caller surfaces a clear error). ``backend=bus``
+    has no local target — also a misconfiguration for migration.
     """
     if isinstance(backend, CompositeArtifactBackend):
-        # Reach into the composite to get both halves; the
+        # Use the public accessors to avoid coupling to private
+        # ``_local`` / ``_fallback`` attribute names. The
         # migration explicitly needs to bypass the composite's
         # local-first read policy because it's the side
         # *populating* the local store.
-        return backend._local, backend._fallback
+        return backend.local, backend.fallback
     if isinstance(backend, LocalArtifactStore):
         # Local-only — no fallback configured, so nothing to
         # migrate from. The handler returns a clear error so the
@@ -823,11 +824,43 @@ def _migration_endpoints(
     return None, None
 
 
-# Cap for the per-artifact content fetch during migration. Sized
-# to ``MAX_ARTIFACT_BYTES`` (10 MiB) on the bus side so a single
-# call pulls the full body. Larger artifacts can't exist on the
-# bus side, so any truncation here would indicate a bug.
+# Cap for the per-artifact content fetch during migration. The
+# bus's ``HARD_MAX_CHARS=20000`` clamp on its REST surface means
+# any value above 20K is silently capped at 20K on the source
+# side — so a fetch of an artifact larger than 20K characters
+# returns ``truncated=True`` and ``_migrate_one`` records it as a
+# per-artifact error rather than writing partial content. The
+# value here is therefore the requested ceiling, not what the
+# bus will actually return; raising it requires a corresponding
+# change on the bus side. Phase 4c may revisit by switching
+# migration to a streaming endpoint.
 _MIGRATION_FETCH_CAP_CHARS = 11_000_000
+
+
+def _bool_arg(args: dict[str, Any], name: str, default: bool = False) -> bool:
+    """Coerce ``args[name]`` to bool with strict policy.
+
+    Real ``bool`` values pass through unchanged. The strings
+    ``"true"`` / ``"false"`` / ``"1"`` / ``"0"`` (case-insensitive)
+    are accepted because some bus clients route args through JSON
+    or YAML and the human-typed shape varies. Anything else
+    raises ``ValueError`` so the handler can return a clean
+    envelope — silently treating ``"false"`` as truthy (the
+    default ``bool(value)`` policy on non-empty strings) was the
+    surprising behavior the previous version exhibited.
+    """
+    if name not in args:
+        return default
+    value = args[name]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in ("true", "1", "yes"):
+            return True
+        if norm in ("false", "0", "no", ""):
+            return False
+    raise ValueError(f"{name} must be a boolean")
 
 
 async def _migrate_one(
@@ -858,10 +891,17 @@ async def _migrate_one(
     # Existence check up front: a duplicate-id row will be
     # skipped on the real run, so report it in dry-run too. The
     # metadata round-trip is cheap (no content) and keeps
-    # ``copied`` / ``skipped`` aligned across modes.
+    # ``copied`` / ``skipped`` aligned across modes. Only the
+    # explicit ``"artifact not found"`` envelope falls through
+    # to fetch — a different error (e.g. ``"local store error"``
+    # from a sqlite failure) surfaces per-artifact so a real
+    # local-side issue isn't masked by an attempted create.
     existing = await target.metadata(aid)
-    if isinstance(existing, dict) and "error" not in existing:
-        return "skipped"
+    if isinstance(existing, dict):
+        if "error" not in existing:
+            return "skipped"
+        if existing.get("error") != "artifact not found":
+            return f"metadata failed: {existing['error']}"
 
     body = await source.get(aid, offset=0, max_chars=_MIGRATION_FETCH_CAP_CHARS)
     if not isinstance(body, dict):

@@ -307,6 +307,19 @@ async def test_close_closes_both_halves():
     assert local.closed and fallback.closed
 
 
+def test_public_accessors_return_halves():
+    """The migration tooling needs the local + fallback halves
+    to populate the local store. Public ``local`` / ``fallback``
+    accessors keep that coupling explicit instead of forcing
+    callers to reach into ``_local`` / ``_fallback``.
+    """
+    local = _Recorder("local")
+    fallback = _Recorder("fallback")
+    composite = CompositeArtifactBackend(local=local, fallback=fallback)
+    assert composite.local is local
+    assert composite.fallback is fallback
+
+
 @pytest.mark.asyncio
 async def test_close_continues_when_one_half_raises():
     """A wedged backend can't poison the other half's cleanup —

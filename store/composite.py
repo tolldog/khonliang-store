@@ -20,6 +20,7 @@ import logging
 from typing import Any, Optional
 
 from store.artifacts import ArtifactBackend, ListResult
+from store.local_store import MAX_LIST_LIMIT
 
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,22 @@ class CompositeArtifactBackend(ArtifactBackend):
     ) -> None:
         self._local = local
         self._fallback = fallback
+
+    @property
+    def local(self) -> ArtifactBackend:
+        """Read-only accessor for the local (write-target) half.
+
+        Stable name so callers (the migration tooling in
+        ``store.agent``, future Phase 4c work) don't have to
+        reach into ``_local`` and tightly couple to private
+        attributes.
+        """
+        return self._local
+
+    @property
+    def fallback(self) -> ArtifactBackend:
+        """Read-only accessor for the fallback (read-source) half."""
+        return self._fallback
 
     async def close(self) -> None:
         # Close both halves so neither leaks resources at agent
@@ -233,14 +250,15 @@ class CompositeArtifactBackend(ArtifactBackend):
             return local[:limit]
         # Over-fetch the fallback by ``len(local)`` to compensate
         # for rows that will be discarded as duplicates of
-        # local-side ids. Cap at 100 (the bus's MAX_LIST_LIMIT)
-        # so an oversized request doesn't blow past either the
-        # caller's budget or the bus's clamp. Worst-case the
-        # caller still sees ``limit`` unique rows; without the
-        # over-fetch a fully-overlapping fallback page could
-        # leave the merged list under-filled even when more
-        # unique rows exist further down.
-        fallback_limit = min(100, limit + len(local))
+        # local-side ids. Cap at ``MAX_LIST_LIMIT`` (shared with
+        # local_store + the bus's REST clamp) so an oversized
+        # request doesn't blow past either the caller's budget
+        # or the bus's clamp. Worst-case the caller still sees
+        # ``limit`` unique rows; without the over-fetch a
+        # fully-overlapping fallback page could leave the merged
+        # list under-filled even when more unique rows exist
+        # further down.
+        fallback_limit = min(MAX_LIST_LIMIT, limit + len(local))
         fallback = await self._fallback.list(
             session_id=session_id, kind=kind, producer=producer, limit=fallback_limit,
         )
