@@ -87,9 +87,11 @@ def _build_backend(*, config_path: str, bus_url: str) -> ArtifactBackend:
     which backend is in use at startup.
     """
     cfg = _read_artifacts_config(config_path)
-    backend_kind = (cfg.get("backend") or "bus").strip().lower()
+    backend_value = _str_or_none(cfg, "backend", config_path)
+    backend_kind = (backend_value or "bus").strip().lower()
     if backend_kind == "local":
-        db_path = _resolve_db_path(cfg.get("db_path"), config_path)
+        db_path_value = _str_or_none(cfg, "db_path", config_path)
+        db_path = _resolve_db_path(db_path_value, config_path)
         logger.info("store backend: local (db_path=%s)", db_path)
         return LocalArtifactStore(db_path)
     if backend_kind != "bus":
@@ -99,6 +101,27 @@ def _build_backend(*, config_path: str, bus_url: str) -> ArtifactBackend:
         )
     logger.info("store backend: bus (bus_url=%s)", bus_url)
     return BusBackedArtifactStore(bus_url)
+
+
+def _str_or_none(cfg: dict[str, Any], key: str, config_path: str) -> Optional[str]:
+    """Return the YAML-decoded ``cfg[key]`` if it's a string, else None.
+
+    YAML can decode ``backend: 1`` as an int and ``backend: ~`` as
+    None; the previous code went straight to ``.strip().lower()``
+    on the result and crashed at startup on either. Now we
+    log-and-default on any non-string so the agent boots
+    successfully and the operator sees the typo in the log.
+    """
+    value = cfg.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    logger.warning(
+        "invalid artifacts.%s=%r in %s — expected string; using default",
+        key, value, config_path,
+    )
+    return None
 
 
 def _read_artifacts_config(config_path: str) -> dict[str, Any]:
@@ -480,10 +503,15 @@ class StoreAgent(BaseAgent):
         content = args.get("content")
         if not isinstance(content, str):
             return {"error": "content must be a string"}
-        metadata = args.get("metadata") or {}
+        # ``key in args`` rather than ``args.get(...) or default`` so a
+        # caller-supplied falsey-but-invalid value (e.g.
+        # ``metadata: []`` or ``source_artifacts: 0``) still trips the
+        # isinstance check below instead of being silently coerced
+        # to the default and waved through.
+        metadata = args["metadata"] if "metadata" in args else {}
         if not isinstance(metadata, dict):
             return {"error": "metadata must be an object"}
-        sources = args.get("source_artifacts") or []
+        sources = args["source_artifacts"] if "source_artifacts" in args else []
         if not isinstance(sources, list):
             return {"error": "source_artifacts must be an array"}
         # ``id`` overlaps with the bus's wire field name; "" → auto.

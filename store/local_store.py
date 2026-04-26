@@ -436,9 +436,14 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
             try:
                 out[json_field] = json.loads(raw)
             except json.JSONDecodeError:
-                # Preserve raw on bad JSON rather than crash the
-                # whole list response — a single corrupt row
-                # shouldn't take out the others.
+                # On corrupt JSON, fall back to the empty
+                # shape-compatible value (``{}`` for metadata,
+                # ``[]`` for source_artifacts) rather than crash
+                # the whole list response — a single bad row
+                # shouldn't take out the others. The corrupt
+                # bytes are gone from the dict but the row is
+                # still readable via :meth:`_sync_content` for
+                # forensics.
                 out[json_field] = {} if json_field == "metadata" else []
     return out
 

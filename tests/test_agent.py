@@ -601,6 +601,11 @@ async def test_artifact_create_validates_required_fields(harness, backend):
         ({"kind": "note", "title": "t"}, "content must be a string"),
         ({"kind": "note", "title": "t", "content": "x", "metadata": "not-an-object"}, "metadata must be an object"),
         ({"kind": "note", "title": "t", "content": "x", "source_artifacts": "not-a-list"}, "source_artifacts must be an array"),
+        # Falsey-but-invalid types used to slip past
+        # ``args.get("metadata") or {}`` since the falsey value
+        # was coerced into the default before the type check.
+        ({"kind": "note", "title": "t", "content": "x", "metadata": []}, "metadata must be an object"),
+        ({"kind": "note", "title": "t", "content": "x", "source_artifacts": 0}, "source_artifacts must be an array"),
     ]
     for args, expected in cases:
         result = await harness.call("artifact_create", args)
@@ -672,3 +677,30 @@ def test_build_backend_unknown_backend_falls_back_to_bus(tmp_path):
     cfg.write_text("artifacts:\n  backend: hypothetical\n")
     backend = _build_backend(config_path=str(cfg), bus_url="http://bus")
     assert isinstance(backend, BusBackedArtifactStore)
+
+
+def test_build_backend_handles_non_string_config_values(tmp_path):
+    """YAML happily decodes ``backend: 1`` as an int and
+    ``db_path: ~`` as None. The previous code went straight to
+    ``.strip().lower()`` on those and crashed at startup; now
+    they're rejected at the config-load layer with a warning so
+    the agent boots safely.
+    """
+    from store.agent import _build_backend
+    from store.artifacts import BusBackedArtifactStore
+    from store.local_store import LocalArtifactStore
+
+    # Non-string backend value → fallback to bus.
+    bad_backend = tmp_path / "bad-backend.yaml"
+    bad_backend.write_text("artifacts:\n  backend: 1\n")
+    backend = _build_backend(config_path=str(bad_backend), bus_url="http://bus")
+    assert isinstance(backend, BusBackedArtifactStore)
+
+    # Non-string db_path with backend=local → still picks
+    # LocalArtifactStore but with the resolved default db path
+    # (next to the config), not the malformed value.
+    bad_db_path = tmp_path / "bad-db-path.yaml"
+    bad_db_path.write_text("artifacts:\n  backend: local\n  db_path: []\n")
+    backend2 = _build_backend(config_path=str(bad_db_path), bus_url="http://bus")
+    assert isinstance(backend2, LocalArtifactStore)
+    assert backend2._db_path == str(tmp_path / "store_artifacts.db")
