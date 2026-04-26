@@ -50,7 +50,7 @@ from khonliang_bus import BaseAgent, Skill, handler
 
 from store.artifacts import ArtifactBackend, BusBackedArtifactStore
 from store.composite import CompositeArtifactBackend
-from store.local_store import LocalArtifactStore, MAX_LIST_LIMIT
+from store.local_store import HARD_MAX_CHARS, LocalArtifactStore, MAX_LIST_LIMIT
 from store.viewer import ArtifactRef, PreparedTab, display as viewer_display
 
 logger = logging.getLogger(__name__)
@@ -593,8 +593,10 @@ class StoreAgent(BaseAgent):
         ``LocalArtifactStore.create(artifact_id=...)`` so ids are
         preserved. Idempotent: a duplicate-id INSERT raises
         :class:`sqlite3.IntegrityError`, which the local backend
-        translates into ``{error: "duplicate artifact id"}``;
-        we count those as ``skipped``.
+        translates into an error envelope of the form
+        ``{"error": "duplicate artifact id: <sqlite message>"}``;
+        ``_migrate_one`` recognizes the prefix and counts those
+        responses as ``skipped``.
 
         Single-page migration. The bus's list endpoint takes no
         cursor, so this skill processes only the first ``limit``
@@ -892,19 +894,18 @@ def _migration_endpoints(
     return None, None
 
 
-# Cap for the per-artifact content fetch during migration. Set
-# to the bus's ``HARD_MAX_CHARS=20000`` clamp on its REST surface
-# so the requested size is intentionally bounded even if a
-# future fallback backend honors ``max_chars`` directly (the
-# previous 11M ceiling was effectively dead — bus clamped the
-# request to 20K anyway — but would have permitted very large
-# transfers against a non-bus backend). A fetch of an artifact
-# larger than this cap returns ``truncated=True`` and
-# ``_migrate_one`` records it as a per-artifact error rather
-# than writing partial content. Raising this limit requires a
-# corresponding change on the bus side; Phase 4c may revisit by
-# switching migration to a streaming endpoint.
-_MIGRATION_FETCH_CAP_CHARS = 20_000
+# Cap for the per-artifact content fetch during migration. Sourced
+# from :data:`store.local_store.HARD_MAX_CHARS` (which mirrors the
+# bus's REST clamp) so changing the cap in one place propagates
+# here too. The previous 11M ceiling was effectively dead — bus
+# clamped the request to 20K anyway — but would have permitted
+# very large transfers against a non-bus backend that honored
+# ``max_chars`` directly. A fetch of an artifact larger than this
+# cap returns ``truncated=True`` and ``_migrate_one`` records it
+# as a per-artifact error rather than writing partial content.
+# Phase 4c may revisit by switching migration to a streaming
+# endpoint.
+_MIGRATION_FETCH_CAP_CHARS = HARD_MAX_CHARS
 
 
 def _bool_arg(args: dict[str, Any], name: str, default: bool = False) -> bool:
