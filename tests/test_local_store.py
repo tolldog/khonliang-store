@@ -141,6 +141,24 @@ async def test_create_rejects_non_json_serializable_metadata(backend):
     assert "JSON-serializable" in result["error"]
 
 
+@pytest.mark.asyncio
+async def test_create_rejects_circular_reference_metadata(backend):
+    """``json.dumps`` raises ``ValueError`` (not TypeError) on
+    circular references. Catching only TypeError would let
+    these crash the skill call. Bus clients passing structured
+    args round-tripped through pickle/yaml could realistically
+    construct circular shapes — the explicit guard keeps the
+    handler's contract honest.
+    """
+    cycle: dict = {"k": "v"}
+    cycle["self"] = cycle
+    result = await backend.create(
+        kind="note", title="t", content="c", metadata=cycle,
+    )
+    assert "error" in result
+    assert "JSON-serializable" in result["error"]
+
+
 # -- metadata -----------------------------------------------------------------
 
 
@@ -217,6 +235,79 @@ async def test_list_with_zero_limit_returns_empty(backend):
         await backend.create(kind="note", title=f"a-{i}", content="x")
     items = await backend.list(limit=0)
     assert items == []
+
+
+@pytest.mark.asyncio
+async def test_list_ordering_stable_under_same_timestamp(tmp_path):
+    """When two rows share an identical ``created_at``, ``rowid
+    DESC`` (insertion-order monotonic) takes over as the
+    tie-breaker so ``list()``'s "newest first" stays stable.
+    Random UUID-derived ``id`` sort can't represent insertion
+    order, hence the ``rowid`` choice.
+    """
+    import sqlite3 as _sqlite3
+    db_path = str(tmp_path / "ordering.db")
+    store = LocalArtifactStore(db_path)
+    try:
+        # Force-insert three rows with identical created_at so
+        # the secondary sort actually matters. Using the raw
+        # connection sidesteps create()'s UUID + size accounting
+        # but exercises the same SELECT path the public list()
+        # uses.
+        conn = store._connect()
+        for title in ("first", "second", "third"):
+            conn.execute(
+                """
+                INSERT INTO artifacts
+                  (id, kind, title, size_bytes, sha256, content, created_at)
+                VALUES (?, 'note', ?, 0, '', '', '2026-04-26T00:00:00.000Z')
+                """,
+                (f"art_{title}", title),
+            )
+        conn.commit()
+        items = await store.list()
+        ids = [item["id"] for item in items]
+        # Insertion order was first, second, third. With the
+        # rowid tie-breaker, "newest first" yields third → second → first.
+        assert ids == ["art_third", "art_second", "art_first"]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_read_methods_return_error_envelope_on_sqlite_failure(tmp_path):
+    """Read methods must surface a stable ``{"error": "local
+    store error"}`` envelope on sqlite3 failures (DB locked /
+    corruption / permission), not raise. ``create()``-side
+    handler already does this; the read side now matches.
+
+    Simulates a failure by closing the underlying connection
+    out from under the store: subsequent reads see
+    ``ProgrammingError: Cannot operate on a closed database`` —
+    a ``sqlite3.Error`` subclass.
+    """
+    import sqlite3 as _sqlite3
+    store = LocalArtifactStore(str(tmp_path / "broken.db"))
+    # Force connection open + close it underneath the store so
+    # the cached _conn is now invalid.
+    store._connect().close()
+    for op_name, coro in [
+        ("metadata", store.metadata("art_x")),
+        ("list", store.list()),
+        ("get", store.get("art_x")),
+        ("head", store.head("art_x")),
+        ("tail", store.tail("art_x")),
+        ("grep", store.grep("art_x", pattern="foo")),
+        ("excerpt", store.excerpt("art_x", start_line=1, end_line=5)),
+    ]:
+        result = await coro
+        assert isinstance(result, dict), op_name
+        assert result.get("error") == "local store error", (
+            f"{op_name} did not surface the expected envelope: {result}"
+        )
+    # After the failure, the store is in a degraded state; close
+    # is idempotent so the test cleanup still works.
+    await store.close()
 
 
 # -- get ----------------------------------------------------------------------

@@ -160,15 +160,17 @@ class LocalArtifactStore(ArtifactBackend):
         try:
             meta_json = json.dumps(metadata or {}, sort_keys=True)
             sources_json = json.dumps(source_artifacts or [], sort_keys=True)
-        except TypeError as exc:
+        except (TypeError, ValueError) as exc:
             # ``metadata`` is annotated as ``dict[str, Any]`` but
             # callers can supply non-JSON-serializable values
-            # (datetime, bytes, set). Catch here so the handler
-            # surfaces a clean error envelope instead of letting
-            # the exception bubble up and fail the skill call.
+            # (datetime / bytes / set raise TypeError) or
+            # circular references (raise ValueError). Catch both
+            # here so the handler surfaces a clean error envelope
+            # instead of letting either exception bubble up and
+            # fail the skill call.
             logger.warning(
-                "rejecting non-JSON-serializable metadata/source_artifacts: %s",
-                exc,
+                "rejecting non-JSON-serializable metadata/source_artifacts: %s: %s",
+                type(exc).__name__, exc,
             )
             return {
                 "error": "metadata and source_artifacts must be JSON-serializable",
@@ -235,8 +237,28 @@ class LocalArtifactStore(ArtifactBackend):
 
     # -- ArtifactBackend reads -------------------------------------------
 
+    @staticmethod
+    def _store_error_envelope(op: str, exc: sqlite3.Error) -> dict[str, Any]:
+        """Stable error envelope for sqlite3 failures during reads.
+
+        Same shape and policy as the broader
+        ``_sync_create``-side handler: log the full exception
+        under our logger (``exc_info=True``) for forensics,
+        return a sanitized ``{"error": "local store error"}``
+        so internal-state details (table names, file paths)
+        don't leak through to bus clients.
+        """
+        logger.warning(
+            "local store error during %s: %s: %s",
+            op, type(exc).__name__, exc, exc_info=True,
+        )
+        return {"error": "local store error"}
+
     async def metadata(self, artifact_id: str) -> dict[str, Any]:
-        result = await asyncio.to_thread(self._sync_metadata, artifact_id)
+        try:
+            result = await asyncio.to_thread(self._sync_metadata, artifact_id)
+        except sqlite3.Error as exc:
+            return self._store_error_envelope("metadata", exc)
         return result or {"error": "artifact not found"}
 
     def _sync_metadata(self, artifact_id: str) -> Optional[dict[str, Any]]:
@@ -261,9 +283,12 @@ class LocalArtifactStore(ArtifactBackend):
         producer: str = "",
         limit: int = 20,
     ) -> ListResult:
-        return await asyncio.to_thread(
-            self._sync_list, session_id, kind, producer, limit
-        )
+        try:
+            return await asyncio.to_thread(
+                self._sync_list, session_id, kind, producer, limit
+            )
+        except sqlite3.Error as exc:
+            return self._store_error_envelope("list", exc)
 
     def _sync_list(
         self, session_id: str, kind: str, producer: str, limit: int,
@@ -290,13 +315,19 @@ class LocalArtifactStore(ArtifactBackend):
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._lock:
             conn = self._connect()
+            # SQLite's ``rowid`` increments monotonically per
+            # INSERT, so it's a stable insertion-order tie-breaker
+            # when two rows share the same ``created_at`` (still
+            # possible at millisecond precision under burst
+            # writes). Random UUID-derived ``id`` doesn't
+            # represent insertion order so it can't serve.
             rows = conn.execute(
                 f"""
                 SELECT id, kind, title, producer, session_id, trace_id,
                        content_type, size_bytes, sha256, metadata,
                        source_artifacts, created_at, ttl
                 FROM artifacts {where}
-                ORDER BY created_at DESC, id DESC
+                ORDER BY created_at DESC, rowid DESC
                 LIMIT ?
                 """,
                 (*params, clamped),
@@ -306,9 +337,12 @@ class LocalArtifactStore(ArtifactBackend):
     async def get(
         self, artifact_id: str, *, offset: int = 0, max_chars: int = DEFAULT_MAX_CHARS,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self._sync_get, artifact_id, offset, max_chars
-        )
+        try:
+            return await asyncio.to_thread(
+                self._sync_get, artifact_id, offset, max_chars
+            )
+        except sqlite3.Error as exc:
+            return self._store_error_envelope("get", exc)
 
     def _sync_get(self, artifact_id: str, offset: int, max_chars: int) -> dict[str, Any]:
         meta = self._sync_metadata(artifact_id)
@@ -326,9 +360,12 @@ class LocalArtifactStore(ArtifactBackend):
     async def head(
         self, artifact_id: str, *, lines: int = 80, max_chars: int = DEFAULT_MAX_CHARS,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self._sync_head, artifact_id, lines, max_chars
-        )
+        try:
+            return await asyncio.to_thread(
+                self._sync_head, artifact_id, lines, max_chars
+            )
+        except sqlite3.Error as exc:
+            return self._store_error_envelope("head", exc)
 
     def _sync_head(self, artifact_id: str, lines: int, max_chars: int) -> dict[str, Any]:
         meta = self._sync_metadata(artifact_id)
@@ -346,9 +383,12 @@ class LocalArtifactStore(ArtifactBackend):
     async def tail(
         self, artifact_id: str, *, lines: int = 80, max_chars: int = DEFAULT_MAX_CHARS,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self._sync_tail, artifact_id, lines, max_chars
-        )
+        try:
+            return await asyncio.to_thread(
+                self._sync_tail, artifact_id, lines, max_chars
+            )
+        except sqlite3.Error as exc:
+            return self._store_error_envelope("tail", exc)
 
     def _sync_tail(self, artifact_id: str, lines: int, max_chars: int) -> dict[str, Any]:
         meta = self._sync_metadata(artifact_id)
@@ -384,10 +424,13 @@ class LocalArtifactStore(ArtifactBackend):
         max_matches: int = 10,
         max_chars: int = DEFAULT_MAX_CHARS,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self._sync_grep, artifact_id, pattern,
-            context_lines, max_matches, max_chars,
-        )
+        try:
+            return await asyncio.to_thread(
+                self._sync_grep, artifact_id, pattern,
+                context_lines, max_matches, max_chars,
+            )
+        except sqlite3.Error as exc:
+            return self._store_error_envelope("grep", exc)
 
     def _sync_grep(
         self, artifact_id: str, pattern: str,
@@ -449,9 +492,12 @@ class LocalArtifactStore(ArtifactBackend):
         end_line: int,
         max_chars: int = DEFAULT_MAX_CHARS,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self._sync_excerpt, artifact_id, start_line, end_line, max_chars,
-        )
+        try:
+            return await asyncio.to_thread(
+                self._sync_excerpt, artifact_id, start_line, end_line, max_chars,
+            )
+        except sqlite3.Error as exc:
+            return self._store_error_envelope("excerpt", exc)
 
     def _sync_excerpt(
         self, artifact_id: str, start_line: int, end_line: int, max_chars: int,
