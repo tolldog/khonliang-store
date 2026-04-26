@@ -13,7 +13,7 @@ from typing import Any, Optional
 import pytest
 from khonliang_bus.testing import AgentTestHarness
 
-from store.agent import StoreAgent, _parse_artifact_refs, _VIEWER_FETCH_CAP_CHARS
+from store.agent import StoreAgent, _parse_artifact_refs
 from store.artifacts import ArtifactBackend
 from store.viewer import ArtifactRef
 from store.viewer import server as viewer_server
@@ -181,13 +181,17 @@ async def test_display_handler_returns_url_session_and_tab_ids(harness, backend)
     assert result["url"].endswith(f"/view/{result['session_id']}")
     assert len(result["tab_ids"]) == 1
     # Display routes through the backend in-process — no bus
-    # round-trip — and asks for the viewer-sized cap (well above
+    # round-trip — and asks for a viewer-sized window (well above
     # the read skills' 4000-char token-budget default) so a
-    # normal-sized artifact renders in full.
-    assert backend.calls == [(
-        "get",
-        {"id": "art_aaa", "offset": 0, "max_chars": _VIEWER_FETCH_CAP_CHARS},
-    )]
+    # normal-sized artifact renders in full. Asserting the cap is
+    # "large" rather than the exact value lets us tune the
+    # constant without churning this test.
+    assert len(backend.calls) == 1
+    op, kwargs = backend.calls[0]
+    assert op == "get"
+    assert kwargs["id"] == "art_aaa"
+    assert kwargs["offset"] == 0
+    assert kwargs["max_chars"] >= 1_000_000
 
 
 @pytest.mark.asyncio
@@ -413,18 +417,38 @@ async def test_artifact_grep_threads_caps(harness, backend):
 @pytest.mark.asyncio
 async def test_artifact_excerpt_requires_line_range(harness, backend):
     result = await harness.call("artifact_excerpt", {"id": "art_a", "start_line": 5})
-    assert result == {"error": "start_line and end_line are required"}
+    # Names the missing arg explicitly rather than the previous
+    # combined "start_line and end_line are required" message —
+    # easier to debug when only one is missing.
+    assert result == {"error": "end_line is required"}
     assert backend.calls == []
 
 
 @pytest.mark.asyncio
 async def test_artifact_excerpt_rejects_non_integer_lines(harness, backend):
     result = await harness.call("artifact_excerpt", {
-        "id": "art_a", "start_line": "abc", "end_line": "xyz",
+        "id": "art_a", "start_line": "abc", "end_line": 25,
     })
-    assert "error" in result
-    assert "integers" in result["error"]
+    assert result == {"error": "start_line must be an integer"}
     assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_int_args_reject_booleans(harness, backend):
+    """``bool`` is a subclass of ``int`` in Python, so a JSON
+    client typo (e.g., ``max_chars: true``) would otherwise
+    silently coerce to ``max_chars=1`` and return very different
+    content than the caller intended. Reject explicitly.
+    """
+    for op, args in [
+        ("artifact_get", {"id": "art_a", "max_chars": True}),
+        ("artifact_head", {"id": "art_a", "lines": False}),
+        ("artifact_excerpt", {"id": "art_a", "start_line": True, "end_line": 10}),
+    ]:
+        result = await harness.call(op, args)
+        assert "must be an integer" in result.get("error", ""), (
+            f"{op} accepted a boolean: {result}"
+        )
 
 
 @pytest.mark.asyncio

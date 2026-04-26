@@ -339,16 +339,9 @@ class StoreAgent(BaseAgent):
         artifact_id = _required_id(args)
         if not artifact_id:
             return {"error": "id is required"}
-        start_line = args.get("start_line")
-        end_line = args.get("end_line")
-        if start_line is None or end_line is None:
-            return {"error": "start_line and end_line are required"}
         try:
-            start = int(start_line)
-            end = int(end_line)
-        except (TypeError, ValueError):
-            return {"error": "start_line and end_line must be integers"}
-        try:
+            start = _required_int(args, "start_line")
+            end = _required_int(args, "end_line")
             max_chars = _int_arg(args, "max_chars", 4000)
         except ValueError as exc:
             return {"error": str(exc)}
@@ -477,10 +470,35 @@ def _int_arg(args: dict[str, Any], name: str, default: int) -> int:
     silently swallowing junk input would change request semantics
     (offset='abc' silently becomes offset=0) and is exactly the
     kind of corruption that's hard to debug after the fact.
+
+    Booleans are rejected explicitly because ``bool`` is a subclass
+    of ``int`` in Python: ``True → 1`` and ``False → 0`` would let
+    a JSON-client typo (``max_chars: true``) silently change the
+    request to ``max_chars=1`` instead of failing loudly.
     """
     value = args.get(name)
     if value is None or value == "":
         return default
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+
+
+def _required_int(args: dict[str, Any], name: str) -> int:
+    """Like :func:`_int_arg` but with no default — missing is an error.
+
+    Used for required positional integers (``start_line`` /
+    ``end_line``) where falling back to a default would change the
+    request rather than fail loudly.
+    """
+    value = args.get(name)
+    if value is None or value == "":
+        raise ValueError(f"{name} is required")
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
     try:
         return int(value)
     except (TypeError, ValueError) as exc:
