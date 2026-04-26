@@ -452,6 +452,31 @@ async def test_int_args_reject_booleans(harness, backend):
 
 
 @pytest.mark.asyncio
+async def test_int_args_reject_non_integer_floats(harness, backend):
+    """``int(1.9)`` returns ``1`` silently, so ``offset=1.9`` would
+    quietly become ``offset=1`` instead of erroring. Reject any
+    float whose ``is_integer()`` is false.
+    """
+    result = await harness.call("artifact_get", {"id": "art_a", "offset": 1.9})
+    assert result == {"error": "offset must be an integer"}
+    assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_int_args_accept_integer_valued_floats(harness, backend):
+    """JSON encoders can serialize ``1`` as ``1.0``; treating
+    integer-valued floats as equivalent is friendlier than
+    rejecting a wire-format quirk. ``1.5`` still gets rejected
+    by the test above.
+    """
+    backend.response = {"text": ""}
+    await harness.call("artifact_get", {"id": "art_a", "offset": 100.0})
+    op, kwargs = backend.calls[0]
+    assert kwargs["offset"] == 100
+    assert isinstance(kwargs["offset"], int)
+
+
+@pytest.mark.asyncio
 async def test_artifact_excerpt_threads_line_range(harness, backend):
     backend.response = {"lines": []}
     await harness.call("artifact_excerpt", {

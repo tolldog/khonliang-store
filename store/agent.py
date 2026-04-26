@@ -463,31 +463,52 @@ def _required_id(args: dict[str, Any]) -> str:
     return str(args.get("id") or "").strip()
 
 
-def _int_arg(args: dict[str, Any], name: str, default: int) -> int:
-    """Coerce ``args[name]`` to int.
+def _coerce_int(name: str, value: Any) -> int:
+    """Coerce a non-empty value to int with the project's strict policy.
 
-    Missing / empty values fall back to ``default``. String-typed
-    numerics ('100' from a JSON payload) are accepted. Anything
-    else (provided but not coercible) raises ``ValueError`` so the
-    caller can return an explicit ``{"error": ...}`` envelope —
-    silently swallowing junk input would change request semantics
-    (offset='abc' silently becomes offset=0) and is exactly the
-    kind of corruption that's hard to debug after the fact.
+    Reject:
 
-    Booleans are rejected explicitly because ``bool`` is a subclass
-    of ``int`` in Python: ``True → 1`` and ``False → 0`` would let
-    a JSON-client typo (``max_chars: true``) silently change the
-    request to ``max_chars=1`` instead of failing loudly.
+    * ``bool`` — ``True``/``False`` would silently become 1/0
+      because ``bool`` is a subclass of ``int`` in Python.
+    * Non-integer floats (``1.9`` would silently truncate to ``1``
+      via ``int()`` and change the request — different from what
+      the caller asked for).
+
+    Accept integer-valued floats (``1.0`` → ``1``) since JSON
+    can serialize ``1`` as either ``1`` or ``1.0`` depending on
+    the encoder; treating them as equivalent is friendlier than
+    rejecting a wire-format quirk. String-typed numerics
+    (``"100"``) coerce normally.
+
+    Raises ``ValueError`` with a per-arg message on any other
+    shape; the caller wraps it in an ``{"error": ...}`` envelope.
     """
-    value = args.get(name)
-    if value is None or value == "":
-        return default
     if isinstance(value, bool):
         raise ValueError(f"{name} must be an integer")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"{name} must be an integer")
+        return int(value)
     try:
         return int(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be an integer") from exc
+
+
+def _int_arg(args: dict[str, Any], name: str, default: int) -> int:
+    """Coerce ``args[name]`` to int.
+
+    Missing / empty values fall back to ``default``. Provided
+    values pass through :func:`_coerce_int` for the bool / non-
+    integer-float / non-numeric rejection policy. Silently
+    swallowing junk input would change request semantics (e.g.
+    ``offset='abc'`` becoming ``offset=0``) and is exactly the
+    kind of corruption that's hard to debug after the fact.
+    """
+    value = args.get(name)
+    if value is None or value == "":
+        return default
+    return _coerce_int(name, value)
 
 
 def _required_int(args: dict[str, Any], name: str) -> int:
@@ -500,12 +521,7 @@ def _required_int(args: dict[str, Any], name: str) -> int:
     value = args.get(name)
     if value is None or value == "":
         raise ValueError(f"{name} is required")
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must be an integer")
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be an integer") from exc
+    return _coerce_int(name, value)
 
 
 def _parse_artifact_refs(raw: Any) -> list[ArtifactRef]:
