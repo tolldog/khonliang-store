@@ -724,10 +724,18 @@ class StoreAgent(BaseAgent):
             else:
                 # Preserve the pre-strip id (or a sentinel) in
                 # error reports so an operator can grep the bus
-                # corpus for the offending row — a stripped
-                # empty string would otherwise show up as
-                # ``"id": ""`` and offer zero diagnostic value.
-                reported_id = raw_id or "<missing>"
+                # corpus for the offending row. Three cases:
+                # truly missing → ``<missing>``; a
+                # whitespace-only id (which strips to empty) →
+                # ``<whitespace-only id: '...'>`` so the
+                # original whitespace is visible; otherwise the
+                # raw id passes through.
+                if raw_id == "":
+                    reported_id = "<missing>"
+                elif raw_id.strip() == "":
+                    reported_id = f"<whitespace-only id: {raw_id!r}>"
+                else:
+                    reported_id = raw_id
                 errors.append({"id": reported_id, "error": outcome})
 
         return {
@@ -882,17 +890,19 @@ def _migration_endpoints(
     return None, None
 
 
-# Cap for the per-artifact content fetch during migration. The
-# bus's ``HARD_MAX_CHARS=20000`` clamp on its REST surface means
-# any value above 20K is silently capped at 20K on the source
-# side — so a fetch of an artifact larger than 20K characters
-# returns ``truncated=True`` and ``_migrate_one`` records it as a
-# per-artifact error rather than writing partial content. The
-# value here is therefore the requested ceiling, not what the
-# bus will actually return; raising it requires a corresponding
-# change on the bus side. Phase 4c may revisit by switching
-# migration to a streaming endpoint.
-_MIGRATION_FETCH_CAP_CHARS = 11_000_000
+# Cap for the per-artifact content fetch during migration. Set
+# to the bus's ``HARD_MAX_CHARS=20000`` clamp on its REST surface
+# so the requested size is intentionally bounded even if a
+# future fallback backend honors ``max_chars`` directly (the
+# previous 11M ceiling was effectively dead — bus clamped the
+# request to 20K anyway — but would have permitted very large
+# transfers against a non-bus backend). A fetch of an artifact
+# larger than this cap returns ``truncated=True`` and
+# ``_migrate_one`` records it as a per-artifact error rather
+# than writing partial content. Raising this limit requires a
+# corresponding change on the bus side; Phase 4c may revisit by
+# switching migration to a streaming endpoint.
+_MIGRATION_FETCH_CAP_CHARS = 20_000
 
 
 def _bool_arg(args: dict[str, Any], name: str, default: bool = False) -> bool:

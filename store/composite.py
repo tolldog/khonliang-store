@@ -85,9 +85,14 @@ class CompositeArtifactBackend(ArtifactBackend):
             try:
                 await backend.close()
             except Exception as exc:  # noqa: BLE001
+                # ``exc_info=True`` to match the rest of the
+                # repo's error-log convention — close-time
+                # failures are rare and the traceback is the
+                # main diagnostic when one happens.
                 logger.warning(
                     "composite backend close failed for %s: %s: %s",
                     label, type(exc).__name__, exc,
+                    exc_info=True,
                 )
 
     # -- writes go local-only --------------------------------------------
