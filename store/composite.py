@@ -235,9 +235,12 @@ class CompositeArtifactBackend(ArtifactBackend):
           happened to know.
         * Fallback error envelope → degraded view. The local
           rows return as a best-effort list rather than masking
-          the local data behind a transient fallback transport
-          issue. The fallback failure surfaces in the
-          BusBackedArtifactStore log instead.
+          the local data behind a fallback-side failure. Note
+          that ``BusBackedArtifactStore`` only writes to its own
+          logger on transport-level exceptions
+          (``httpx.HTTPError``); 4xx/5xx and non-JSON responses
+          surface as error envelopes without a log line, so a
+          fallback failure here may be silent in the agent log.
         """
         # Clamp ``limit`` to ``[0, MAX_LIST_LIMIT]`` to mirror the
         # underlying backends' policy, and to avoid surprises:

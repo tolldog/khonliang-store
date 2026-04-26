@@ -835,19 +835,31 @@ def _migration_endpoints(
 ) -> Tuple[Optional[ArtifactBackend], Optional[ArtifactBackend]]:
     """Pick out (local_target, fallback_source) from the live backend.
 
-    For ``backend=composite`` both halves are reachable via the
-    public ``local`` / ``fallback`` accessors so the migration
-    doesn't depend on private attribute names. ``backend=local``
-    has no fallback (caller surfaces a clear error). ``backend=bus``
-    has no local target — also a misconfiguration for migration.
+    Migration only works when the write target is a
+    :class:`LocalArtifactStore`: ``_migrate_one``'s
+    duplicate-detection path checks for ``LocalArtifactStore``'s
+    specific ``"duplicate artifact id"`` envelope, and a
+    custom local half wouldn't increment the ``skipped`` count
+    correctly. The fallback (read source) can be any
+    ``ArtifactBackend`` that satisfies the ABC; tests use stub
+    backends and production wires ``BusBackedArtifactStore``.
+
+    For ``backend=composite`` the public ``local`` / ``fallback``
+    accessors expose both halves so the migration doesn't depend
+    on private attribute names. ``backend=local`` has no
+    fallback (caller surfaces a clear error). ``backend=bus``
+    has no local target — also a misconfiguration for
+    migration.
     """
     if isinstance(backend, CompositeArtifactBackend):
-        # Use the public accessors to avoid coupling to private
-        # ``_local`` / ``_fallback`` attribute names. The
-        # migration explicitly needs to bypass the composite's
-        # local-first read policy because it's the side
-        # *populating* the local store.
-        return backend.local, backend.fallback
+        local = backend.local
+        fallback = backend.fallback
+        if isinstance(local, LocalArtifactStore):
+            return local, fallback
+        # Miswired composite (custom local half): the
+        # duplicate-id envelope shape isn't guaranteed, so
+        # decline rather than report misleading skip counts.
+        return None, None
     if isinstance(backend, LocalArtifactStore):
         # Local-only — no fallback configured, so nothing to
         # migrate from. The handler returns a clear error so the
@@ -920,8 +932,11 @@ async def _migrate_one(
     if not aid:
         return "missing id"
 
-    kind = str(meta.get("kind") or "")
-    title = str(meta.get("title") or "")
+    # Match ``handle_artifact_create``'s normalization so a
+    # whitespace-only ``"   "`` from the bus side doesn't pass
+    # validation and end up persisted locally.
+    kind = str(meta.get("kind") or "").strip()
+    title = str(meta.get("title") or "").strip()
     if not kind:
         return "create failed: kind is required"
     if not title:
