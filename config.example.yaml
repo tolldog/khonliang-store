@@ -5,18 +5,23 @@
 bus_url: http://localhost:8788
 
 # Artifact backend selection. The default ("bus") preserves the
-# Phase-2 behavior: store proxies all reads to the bus's REST
-# routes and rejects writes (the bus owns the data today). Set
-# to "local" to switch on the Phase-4a SQLite-backed write path
-# — store-side artifact_create will then persist locally and all
-# reads come from the local DB.
+# original Phase-2 behavior: store proxies all reads to the bus's
+# REST routes and rejects writes.
 #
-# Phase 4b will add a "composite" mode that unions local writes
-# with bus-fallback reads; until then, switching to "local" makes
-# bus-resident artifacts invisible to the store agent.
+# - "local" (Phase 4a): store owns reads + writes through a local
+#   SQLite file. Bus-resident artifacts become invisible to the
+#   store agent — useful only for greenfield deployments with no
+#   existing corpus.
+#
+# - "composite" (Phase 4b, recommended for migrating deployments):
+#   writes go to the local SQLite file; reads check local first
+#   and fall through to the bus's REST surface for any artifact
+#   not yet migrated. Pair with the artifact_migrate_from_bus
+#   skill to copy historical artifacts into the local DB; the
+#   migration is idempotent so a partial run is safe to re-run.
 artifacts:
-  backend: bus      # bus | local
-  # Path to the SQLite file when backend=local. Relative paths
-  # resolve against the directory containing this config file.
-  # Default: store_artifacts.db next to the config.
+  backend: bus      # bus | local | composite
+  # Path to the SQLite file when backend=local or backend=composite.
+  # Relative paths resolve against the directory containing this
+  # config file. Default: store_artifacts.db next to the config.
   # db_path: data/store_artifacts.db

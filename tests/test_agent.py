@@ -704,3 +704,203 @@ def test_build_backend_handles_non_string_config_values(tmp_path):
     backend2 = _build_backend(config_path=str(bad_db_path), bus_url="http://bus")
     assert isinstance(backend2, LocalArtifactStore)
     assert backend2._db_path == str(tmp_path / "store_artifacts.db")
+
+
+# -- composite backend wiring ------------------------------------------------
+
+
+def test_build_backend_composite_pairs_local_and_bus(tmp_path):
+    """``backend: composite`` should construct a
+    :class:`CompositeArtifactBackend` whose halves are a
+    :class:`LocalArtifactStore` (for writes + local-first reads)
+    and a :class:`BusBackedArtifactStore` (for read fallback).
+    """
+    from store.agent import _build_backend
+    from store.composite import CompositeArtifactBackend
+    from store.artifacts import BusBackedArtifactStore
+    from store.local_store import LocalArtifactStore
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("artifacts:\n  backend: composite\n")
+    backend = _build_backend(config_path=str(cfg), bus_url="http://bus")
+    assert isinstance(backend, CompositeArtifactBackend)
+    assert isinstance(backend._local, LocalArtifactStore)
+    assert isinstance(backend._fallback, BusBackedArtifactStore)
+
+
+# -- artifact_migrate_from_bus -----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_migrate_requires_local_target(harness, backend):
+    """The default ``BusBackedArtifactStore`` (read-only) has
+    nowhere to copy *to*. The handler must surface that as a
+    clear error rather than silently doing nothing.
+    """
+    # FakeBackend has no migration endpoints (not Local nor Composite).
+    result = await harness.call("artifact_migrate_from_bus", {})
+    assert "error" in result
+    assert "local backend" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_migrate_requires_bus_fallback(harness, tmp_path):
+    """``backend=local`` (no fallback) is similarly stuck —
+    nothing to migrate from. Operator should switch to
+    ``backend=composite``.
+    """
+    from store.local_store import LocalArtifactStore
+
+    local = LocalArtifactStore(str(tmp_path / "local.db"))
+    previous = harness.agent.set_backend(local)
+    try:
+        result = await harness.call("artifact_migrate_from_bus", {})
+        assert "error" in result
+        assert "composite" in result["error"]
+    finally:
+        await local.close()
+        await previous.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_copies_artifacts_through_composite(harness, tmp_path):
+    """End-to-end happy path: composite backend with a fake
+    fallback that has two artifacts; artifact_migrate_from_bus
+    pages through the list, fetches each artifact's content, and
+    writes it to the local SQLite — all under the same id so
+    callers see the same identifier under both backends.
+    """
+    from store.local_store import LocalArtifactStore
+    from store.composite import CompositeArtifactBackend
+
+    local = LocalArtifactStore(str(tmp_path / "migration.db"))
+    fallback_state = {
+        "art_one": {"meta": {
+            "id": "art_one", "kind": "note", "title": "First",
+            "size_bytes": 5,
+        }, "content": "hello"},
+        "art_two": {"meta": {
+            "id": "art_two", "kind": "log", "title": "Second",
+            "size_bytes": 5,
+        }, "content": "world"},
+    }
+
+    class _Bus(ArtifactBackend):
+        async def list(self, **kw):
+            return [v["meta"] for v in fallback_state.values()]
+        async def metadata(self, aid):
+            v = fallback_state.get(aid)
+            return v["meta"] if v else {"error": "artifact not found"}
+        async def get(self, aid, **kw):
+            v = fallback_state.get(aid)
+            if not v:
+                return {"error": "artifact not found"}
+            return {"artifact": v["meta"], "text": v["content"], "truncated": False}
+        async def head(self, aid, **kw): return {"error": "artifact not found"}
+        async def tail(self, aid, **kw): return {"error": "artifact not found"}
+        async def grep(self, aid, **kw): return {"error": "artifact not found"}
+        async def excerpt(self, aid, **kw): return {"error": "artifact not found"}
+
+    composite = CompositeArtifactBackend(local=local, fallback=_Bus())
+    previous = harness.agent.set_backend(composite)
+    try:
+        result = await harness.call("artifact_migrate_from_bus", {})
+        assert result["copied"] == 2
+        assert result["skipped"] == 0
+        assert result["errors"] == []
+        assert result["scanned"] == 2
+
+        # Round-trip: post-migration metadata reads should hit
+        # local-side rows (no fallback round trip needed).
+        local_meta = await local.metadata("art_one")
+        assert local_meta["title"] == "First"
+        assert local_meta["id"] == "art_one"
+    finally:
+        await composite.close()
+        await previous.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_is_idempotent(harness, tmp_path):
+    """Re-running after a partial run must skip already-present
+    ids rather than erroring on every duplicate-id INSERT. The
+    skip count surfaces the resumption signal so operators see
+    the run made progress.
+    """
+    from store.local_store import LocalArtifactStore
+    from store.composite import CompositeArtifactBackend
+
+    local = LocalArtifactStore(str(tmp_path / "idempotent.db"))
+    state = {
+        "art_x": {"meta": {"id": "art_x", "kind": "note", "title": "X"}, "content": "x"},
+    }
+
+    class _Bus(ArtifactBackend):
+        async def list(self, **kw): return [v["meta"] for v in state.values()]
+        async def metadata(self, aid): return state[aid]["meta"]
+        async def get(self, aid, **kw):
+            return {"artifact": state[aid]["meta"], "text": state[aid]["content"]}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    composite = CompositeArtifactBackend(local=local, fallback=_Bus())
+    previous = harness.agent.set_backend(composite)
+    try:
+        first = await harness.call("artifact_migrate_from_bus", {})
+        assert first["copied"] == 1 and first["skipped"] == 0
+
+        # Re-run: every artifact is already present locally → all skipped.
+        second = await harness.call("artifact_migrate_from_bus", {})
+        assert second["copied"] == 0
+        assert second["skipped"] == 1
+        assert second["errors"] == []
+    finally:
+        await composite.close()
+        await previous.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_dry_run_logs_without_writing(harness, tmp_path):
+    """``dry_run=True`` exercises the same fetch path but never
+    calls ``LocalArtifactStore.create``. The local DB stays
+    empty; the report shows ``copied=N`` so the operator can
+    confirm what a real run would do.
+    """
+    from store.local_store import LocalArtifactStore
+    from store.composite import CompositeArtifactBackend
+
+    local = LocalArtifactStore(str(tmp_path / "dry.db"))
+    state = {
+        "art_y": {"meta": {"id": "art_y", "kind": "note", "title": "Y"}, "content": "y"},
+    }
+
+    class _Bus(ArtifactBackend):
+        async def list(self, **kw): return [v["meta"] for v in state.values()]
+        async def metadata(self, aid): return state[aid]["meta"]
+        async def get(self, aid, **kw):
+            return {"artifact": state[aid]["meta"], "text": state[aid]["content"]}
+        async def head(self, aid, **kw): return {}
+        async def tail(self, aid, **kw): return {}
+        async def grep(self, aid, **kw): return {}
+        async def excerpt(self, aid, **kw): return {}
+
+    composite = CompositeArtifactBackend(local=local, fallback=_Bus())
+    previous = harness.agent.set_backend(composite)
+    try:
+        result = await harness.call("artifact_migrate_from_bus", {"dry_run": True})
+        assert result["copied"] == 1
+        assert result["dry_run"] is True
+        # Local DB stays empty — nothing actually written.
+        local_meta = await local.metadata("art_y")
+        assert local_meta == {"error": "artifact not found"}
+    finally:
+        await composite.close()
+        await previous.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_skill_advertised(harness):
+    skill_names = {s["name"] for s in harness.registration.skills}
+    assert "artifact_migrate_from_bus" in skill_names

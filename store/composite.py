@@ -1,0 +1,250 @@
+"""Composite artifact backend.
+
+Layered backend that bridges Phase 4a's local-only writes with the
+historical bus-resident corpus. Reads try ``local`` first, then
+fall through to ``fallback`` (the bus-backed proxy) when the
+local store reports "artifact not found"; writes go straight to
+``local``. Phase 4c will retire ``fallback`` once the migration
+has run cleanly.
+
+The motivation: switching the Phase-4a default from ``bus`` to
+``local`` would make every artifact created before the migration
+invisible to the store. The composite layer keeps both
+generations visible during the transition while writes
+exclusively flow to the new home.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Optional
+
+from store.artifacts import ArtifactBackend, ListResult
+
+
+logger = logging.getLogger(__name__)
+
+
+# Sentinel produced by the read backends (both LocalArtifactStore
+# and BusBackedArtifactStore) when an artifact isn't present.
+# Centralizing the literal so the fall-through condition stays in
+# step with what the underlying backends actually emit.
+_NOT_FOUND = "artifact not found"
+
+
+def _is_not_found(payload: Any) -> bool:
+    return (
+        isinstance(payload, dict)
+        and payload.get("error") == _NOT_FOUND
+    )
+
+
+class CompositeArtifactBackend(ArtifactBackend):
+    """Local-first reader, local-only writer.
+
+    Writes are routed exclusively to ``local``; the fallback never
+    sees a write. Read methods try ``local`` first; on a clean
+    "artifact not found" envelope they fall through to ``fallback``.
+    Other error envelopes from ``local`` (e.g.,
+    ``"local store error"``) are treated as authoritative and
+    returned directly — falling through on a transport error
+    would mask a real local-side issue behind whatever the bus
+    happened to know.
+    """
+
+    def __init__(
+        self,
+        local: ArtifactBackend,
+        fallback: ArtifactBackend,
+    ) -> None:
+        self._local = local
+        self._fallback = fallback
+
+    async def close(self) -> None:
+        # Close both halves so neither leaks resources at agent
+        # shutdown. Failures are logged and swallowed so a wedged
+        # backend can't poison the other half's cleanup.
+        for label, backend in (("local", self._local), ("fallback", self._fallback)):
+            try:
+                await backend.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "composite backend close failed for %s: %s: %s",
+                    label, type(exc).__name__, exc,
+                )
+
+    # -- writes go local-only --------------------------------------------
+
+    async def create(
+        self,
+        *,
+        kind: str,
+        title: str,
+        content: str,
+        producer: str = "",
+        session_id: str = "",
+        trace_id: str = "",
+        content_type: str = "text/plain",
+        metadata: Optional[dict[str, Any]] = None,
+        source_artifacts: Optional[list[str]] = None,
+        artifact_id: str = "",
+        ttl: Optional[str] = None,
+    ) -> dict[str, Any]:
+        return await self._local.create(
+            kind=kind,
+            title=title,
+            content=content,
+            producer=producer,
+            session_id=session_id,
+            trace_id=trace_id,
+            content_type=content_type,
+            metadata=metadata,
+            source_artifacts=source_artifacts,
+            artifact_id=artifact_id,
+            ttl=ttl,
+        )
+
+    # -- read fall-through ------------------------------------------------
+
+    async def metadata(self, artifact_id: str) -> dict[str, Any]:
+        result = await self._local.metadata(artifact_id)
+        if _is_not_found(result):
+            return await self._fallback.metadata(artifact_id)
+        return result
+
+    async def get(
+        self, artifact_id: str, *, offset: int = 0, max_chars: int = 4000,
+    ) -> dict[str, Any]:
+        result = await self._local.get(
+            artifact_id, offset=offset, max_chars=max_chars,
+        )
+        if _is_not_found(result):
+            return await self._fallback.get(
+                artifact_id, offset=offset, max_chars=max_chars,
+            )
+        return result
+
+    async def head(
+        self, artifact_id: str, *, lines: int = 80, max_chars: int = 4000,
+    ) -> dict[str, Any]:
+        result = await self._local.head(
+            artifact_id, lines=lines, max_chars=max_chars,
+        )
+        if _is_not_found(result):
+            return await self._fallback.head(
+                artifact_id, lines=lines, max_chars=max_chars,
+            )
+        return result
+
+    async def tail(
+        self, artifact_id: str, *, lines: int = 80, max_chars: int = 4000,
+    ) -> dict[str, Any]:
+        result = await self._local.tail(
+            artifact_id, lines=lines, max_chars=max_chars,
+        )
+        if _is_not_found(result):
+            return await self._fallback.tail(
+                artifact_id, lines=lines, max_chars=max_chars,
+            )
+        return result
+
+    async def grep(
+        self,
+        artifact_id: str,
+        *,
+        pattern: str,
+        context_lines: int = 10,
+        max_matches: int = 10,
+        max_chars: int = 4000,
+    ) -> dict[str, Any]:
+        result = await self._local.grep(
+            artifact_id,
+            pattern=pattern,
+            context_lines=context_lines,
+            max_matches=max_matches,
+            max_chars=max_chars,
+        )
+        if _is_not_found(result):
+            return await self._fallback.grep(
+                artifact_id,
+                pattern=pattern,
+                context_lines=context_lines,
+                max_matches=max_matches,
+                max_chars=max_chars,
+            )
+        return result
+
+    async def excerpt(
+        self,
+        artifact_id: str,
+        *,
+        start_line: int,
+        end_line: int,
+        max_chars: int = 4000,
+    ) -> dict[str, Any]:
+        result = await self._local.excerpt(
+            artifact_id,
+            start_line=start_line, end_line=end_line, max_chars=max_chars,
+        )
+        if _is_not_found(result):
+            return await self._fallback.excerpt(
+                artifact_id,
+                start_line=start_line, end_line=end_line, max_chars=max_chars,
+            )
+        return result
+
+    # -- list union ------------------------------------------------------
+
+    async def list(
+        self,
+        *,
+        session_id: str = "",
+        kind: str = "",
+        producer: str = "",
+        limit: int = 20,
+    ) -> ListResult:
+        """Union of local + fallback rows, deduplicated by id.
+
+        Local rows come first (they're authoritative — once
+        migrated, the local copy is canonical). The result is
+        clipped at ``limit`` so a large fallback corpus doesn't
+        blow past the caller's budget.
+
+        On a backend-side error envelope from either side, that
+        envelope passes through verbatim — masking a real
+        transport issue behind a partial result would make the
+        outage harder to diagnose than reporting the failure.
+        """
+        local = await self._local.list(
+            session_id=session_id, kind=kind, producer=producer, limit=limit,
+        )
+        if isinstance(local, dict):
+            return local
+        if len(local) >= limit:
+            # Local side already filled the budget; no need to
+            # round-trip the fallback.
+            return local[:limit]
+        fallback = await self._fallback.list(
+            session_id=session_id, kind=kind, producer=producer, limit=limit,
+        )
+        if isinstance(fallback, dict):
+            # Fallback errored; surface what we got from local
+            # rather than swallowing real data behind a transport
+            # blip. The caller still sees a list — degraded view,
+            # not failure.
+            return local
+        seen_ids = {
+            item.get("id")
+            for item in local
+            if isinstance(item, dict) and item.get("id")
+        }
+        merged = list(local)
+        for item in fallback:
+            if not isinstance(item, dict):
+                continue
+            if item.get("id") in seen_ids:
+                continue
+            merged.append(item)
+            if len(merged) >= limit:
+                break
+        return merged[:limit]

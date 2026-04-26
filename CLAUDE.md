@@ -8,13 +8,18 @@ FR with its own PR.
 
 ## Status
 
+Phase 4b (`fr_store_ef668d56`): `CompositeArtifactBackend(local,
+bus)` — writes go to the local SQLite store; reads check local
+first and fall through to the bus REST surface for any artifact
+not yet migrated. New skill `artifact_migrate_from_bus(limit,
+dry_run)` walks the bus's list endpoint and copies each
+artifact into local SQLite preserving ids; idempotent re-run
+skips already-present rows. Config knob `[artifacts] backend:
+composite` opts in. Default still `bus` until operators have
+run the migration in their environments.
+
 Phase 4a (`fr_store_73e5a6f4`): `LocalArtifactStore` (SQLite-backed
 implementation of `ArtifactBackend`) plus `artifact_create` skill.
-Backend selection is config-driven (`[artifacts] backend: local |
-bus`) and defaults to `bus` to preserve Phase-2 behavior; flip to
-`local` to write through to the new local DB. The bus REST surface
-keeps owning existing data until Phase 4b lands the composite
-backend that unions local + bus reads.
 
 Phase 2 reads (`fr_store_08c1c6b2`): the store agent owns the
 artifact read surface — `artifact_list`, `artifact_metadata`,
@@ -94,12 +99,13 @@ viewer skill.
    `artifact_create` skill (`fr_store_73e5a6f4`). Config-gated
    default keeps the bus backend as the read source until 4b
    lands the union-read.
-5. **Phase 4b** — `CompositeArtifactBackend(local, bus_fallback)`
-   so newly-created artifacts and bus-resident artifacts both
-   appear in store reads, plus migration tooling that copies
-   bus's existing artifacts into the local DB. _Open._
+5. **Phase 4b** ✅ shipped — `CompositeArtifactBackend(local,
+   bus)` (`fr_store_ef668d56`). Local-first reads with bus
+   fallback; writes go local-only; `artifact_migrate_from_bus`
+   skill copies bus-resident artifacts into local SQLite.
+   `[artifacts] backend: composite` opts in.
 6. **Phase 4c** — deprecate bus's `bus_artifact_*` HTTP surface
-   once 4b's migration has run cleanly. _Open._
+   once operators have run the migration. _Open._
 7. **Phase 5** — cross-reference from fr_researcher_000ad07c
    (`stage_payload` / `ingest_from_artifact`) once store owns the
    write path. _Open._

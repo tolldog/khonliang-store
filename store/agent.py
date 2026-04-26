@@ -49,6 +49,7 @@ import yaml
 from khonliang_bus import BaseAgent, Skill, handler
 
 from store.artifacts import ArtifactBackend, BusBackedArtifactStore
+from store.composite import CompositeArtifactBackend
 from store.local_store import LocalArtifactStore
 from store.viewer import ArtifactRef, PreparedTab, display as viewer_display
 
@@ -75,11 +76,12 @@ _VIEWER_FETCH_CAP_CHARS = 2_000_000
 def _build_backend(*, config_path: str, bus_url: str) -> ArtifactBackend:
     """Construct the artifact backend from YAML config.
 
-    Reads ``[artifacts] backend`` (``"bus"`` or ``"local"``) and,
-    for the local backend, ``[artifacts] db_path`` (relative paths
-    resolve against the config file's directory). Defaults to the
-    bus-backed read-only proxy so existing deployments keep
-    working without a config change.
+    Reads ``[artifacts] backend`` (one of ``bus``, ``local``,
+    ``composite``) and — for the local + composite backends —
+    ``[artifacts] db_path`` (relative paths resolve against the
+    config file's directory). Defaults to the bus-backed
+    read-only proxy so existing deployments keep working
+    without a config change.
 
     The selection lives here rather than in ``__init__`` so tests
     can call :meth:`StoreAgent.set_backend` without touching disk
@@ -94,6 +96,17 @@ def _build_backend(*, config_path: str, bus_url: str) -> ArtifactBackend:
         db_path = _resolve_db_path(db_path_value, config_path)
         logger.info("store backend: local (db_path=%s)", db_path)
         return LocalArtifactStore(db_path)
+    if backend_kind == "composite":
+        db_path_value = _str_or_none(cfg, "db_path", config_path)
+        db_path = _resolve_db_path(db_path_value, config_path)
+        logger.info(
+            "store backend: composite (local db_path=%s, fallback bus_url=%s)",
+            db_path, bus_url,
+        )
+        return CompositeArtifactBackend(
+            local=LocalArtifactStore(db_path),
+            fallback=BusBackedArtifactStore(bus_url),
+        )
     if backend_kind != "bus":
         logger.warning(
             "unknown artifacts.backend=%r in %s — falling back to 'bus'",
@@ -343,6 +356,30 @@ class StoreAgent(BaseAgent):
                 since="0.5.0",
             ),
             Skill(
+                "artifact_migrate_from_bus",
+                "Copy artifacts from the bus's REST surface into "
+                "the local SQLite store. Walks /v1/artifacts in "
+                "pages of size limit (default 100, max 100), "
+                "preserving artifact ids so callers see the same "
+                "id under both backends. Returns "
+                "{copied, skipped, errors, scanned}. Skipped "
+                "covers ids already present locally (idempotent "
+                "re-run). Requires backend=composite or "
+                "backend=local with a bus URL configured. "
+                "dry_run logs what would happen without writing.",
+                {
+                    "limit": {
+                        "type": "integer", "default": 100,
+                        "description": (
+                            "Page size for the bus list call; "
+                            "capped at 100 by the bus."
+                        ),
+                    },
+                    "dry_run": {"type": "boolean", "default": False},
+                },
+                since="0.6.0",
+            ),
+            Skill(
                 "display",
                 "Open (or reuse) the in-process viewer and register "
                 "the supplied artifacts as tabs. Returns the viewer URL "
@@ -534,6 +571,119 @@ class StoreAgent(BaseAgent):
         except NotImplementedError as exc:
             return {"error": str(exc)}
 
+    # -- artifact migration ----------------------------------------------
+
+    @handler("artifact_migrate_from_bus")
+    async def handle_artifact_migrate_from_bus(
+        self, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Copy bus-resident artifacts into the local SQLite store.
+
+        Reads the bus's ``/v1/artifacts`` paginated list via a
+        :class:`BusBackedArtifactStore` (the existing bus REST
+        surface), pulls each artifact's content with
+        ``backend.get(id, max_chars=large)``, then calls
+        ``LocalArtifactStore.create(artifact_id=...)`` so ids are
+        preserved. Idempotent: a duplicate-id INSERT raises
+        :class:`sqlite3.IntegrityError`, which the local backend
+        translates into ``{error: "duplicate artifact id"}``;
+        we count those as ``skipped``.
+
+        Pulls metadata in pages of ``limit`` (default 100, the
+        bus's hard cap) and uses the ``id`` of the oldest seen
+        artifact as the next page's exclusive upper bound. The
+        bus list endpoint doesn't accept a cursor today, so we
+        rely on filtering ids we've already seen — slightly
+        wasteful for very large corpora but correct and simple.
+
+        Requires the agent to have a write-capable local
+        backend; ``backend=bus`` would have nowhere to copy to.
+        """
+        try:
+            limit = _int_arg(args, "limit", 100)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        # Cap at 100 to match the bus's MAX_LIST_LIMIT — asking
+        # for more wastes a round trip. Floor at 1 so the loop
+        # terminates.
+        if limit < 1:
+            limit = 1
+        if limit > 100:
+            limit = 100
+        dry_run = bool(args.get("dry_run"))
+
+        local_target, fallback_source = _migration_endpoints(self._backend)
+        if local_target is None:
+            return {
+                "error": (
+                    "artifact_migrate_from_bus requires a local backend; "
+                    "current backend is read-only"
+                ),
+            }
+        if fallback_source is None:
+            # Operator wants to migrate but didn't wire a fallback —
+            # nothing to copy from. Surface the misconfiguration
+            # explicitly rather than silently reporting 0 copied.
+            return {
+                "error": (
+                    "no bus fallback configured; set backend=composite "
+                    "to enable migration"
+                ),
+            }
+
+        copied = 0
+        skipped = 0
+        errors: list[dict[str, Any]] = []
+        scanned = 0
+        seen_ids: set[str] = set()
+
+        # Bound the scan loop so a misbehaving fallback (or an
+        # ever-growing corpus) can't run forever. The cap is high
+        # enough to handle realistic backlogs but low enough to
+        # keep the skill responsive.
+        for _ in range(100):
+            page = await fallback_source.list(limit=limit)
+            if isinstance(page, dict):
+                # Error envelope from the bus side; surface it
+                # rather than silently stopping.
+                return {
+                    "copied": copied, "skipped": skipped,
+                    "errors": errors, "scanned": scanned,
+                    "error": page.get("error", "bus list failed"),
+                }
+            new_in_page = [
+                meta for meta in page
+                if isinstance(meta, dict) and meta.get("id") not in seen_ids
+            ]
+            if not new_in_page:
+                # Either page is empty or every entry has already
+                # been seen this run — we've converged.
+                break
+            for meta in new_in_page:
+                aid = str(meta.get("id") or "")
+                seen_ids.add(aid)
+                scanned += 1
+                outcome = await _migrate_one(
+                    aid=aid, meta=meta,
+                    source=fallback_source,
+                    target=local_target,
+                    dry_run=dry_run,
+                )
+                if outcome == "copied":
+                    copied += 1
+                elif outcome == "skipped":
+                    skipped += 1
+                else:
+                    errors.append({"id": aid, "error": outcome})
+
+        return {
+            "copied": copied,
+            "skipped": skipped,
+            "errors": errors,
+            "scanned": scanned,
+            "dry_run": dry_run,
+        }
+
     # -- display ----------------------------------------------------------
 
     @handler("display")
@@ -638,6 +788,85 @@ class StoreAgent(BaseAgent):
             or "text/plain"
         )
         return content_type, body, dict(meta)
+
+
+def _migration_endpoints(
+    backend: ArtifactBackend,
+) -> Tuple[Optional[ArtifactBackend], Optional[ArtifactBackend]]:
+    """Pick out (local_target, fallback_source) from the live backend.
+
+    For ``backend=composite`` both halves are reachable directly;
+    for ``backend=local`` we don't have a bus fallback in the
+    backend object, so the caller must surface a misconfiguration
+    error. ``backend=bus`` has no local target — also a
+    misconfiguration for the migration skill.
+    """
+    if isinstance(backend, CompositeArtifactBackend):
+        # Reach into the composite to get both halves; the
+        # migration explicitly needs to bypass the composite's
+        # local-first read policy because it's the side
+        # *populating* the local store.
+        return backend._local, backend._fallback
+    if isinstance(backend, LocalArtifactStore):
+        # Local-only — no fallback configured, so nothing to
+        # migrate from. The handler returns a clear error so the
+        # operator switches to backend=composite.
+        return backend, None
+    return None, None
+
+
+# Cap for the per-artifact content fetch during migration. Sized
+# to ``MAX_ARTIFACT_BYTES`` (10 MiB) on the bus side so a single
+# call pulls the full body. Larger artifacts can't exist on the
+# bus side, so any truncation here would indicate a bug.
+_MIGRATION_FETCH_CAP_CHARS = 11_000_000
+
+
+async def _migrate_one(
+    *,
+    aid: str,
+    meta: dict[str, Any],
+    source: ArtifactBackend,
+    target: ArtifactBackend,
+    dry_run: bool,
+) -> str:
+    """Copy a single artifact from source → target.
+
+    Returns ``"copied"`` / ``"skipped"`` / ``"<error string>"``.
+    """
+    if not aid:
+        return "missing id"
+    body = await source.get(aid, offset=0, max_chars=_MIGRATION_FETCH_CAP_CHARS)
+    if isinstance(body, dict) and "error" in body:
+        return f"fetch failed: {body['error']}"
+    text = body.get("text") or body.get("body") or ""
+    if not isinstance(text, str):
+        return "non-string content"
+    if dry_run:
+        return "copied"
+    result = await target.create(
+        kind=str(meta.get("kind") or ""),
+        title=str(meta.get("title") or ""),
+        content=text,
+        producer=str(meta.get("producer") or ""),
+        session_id=str(meta.get("session_id") or ""),
+        trace_id=str(meta.get("trace_id") or ""),
+        content_type=str(meta.get("content_type") or "text/plain"),
+        metadata=meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {},
+        source_artifacts=(
+            meta.get("source_artifacts")
+            if isinstance(meta.get("source_artifacts"), list)
+            else []
+        ),
+        artifact_id=aid,
+        ttl=meta.get("ttl"),
+    )
+    if isinstance(result, dict) and "error" in result:
+        err = result["error"]
+        if "duplicate artifact id" in err:
+            return "skipped"
+        return f"create failed: {err}"
+    return "copied"
 
 
 def _required_id(args: dict[str, Any]) -> str:
