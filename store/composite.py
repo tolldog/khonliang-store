@@ -283,7 +283,17 @@ class CompositeArtifactBackend(ArtifactBackend):
             # Fallback errored; surface what we got from local
             # rather than swallowing real data behind a transport
             # blip. The caller still sees a list — degraded view,
-            # not failure.
+            # not failure. Log a WARNING so the degradation is
+            # visible in the agent log; the underlying
+            # ``BusBackedArtifactStore`` only logs on transport
+            # exceptions, so 4xx/5xx and non-JSON envelopes
+            # would be otherwise silent here.
+            logger.warning(
+                "fallback artifact list failed; returning local-only results "
+                "(error=%r, session_id=%r, kind=%r, producer=%r, limit=%d)",
+                fallback.get("error"),
+                session_id, kind, producer, limit,
+            )
             return local
         seen_ids = {
             item.get("id")

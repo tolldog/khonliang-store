@@ -1017,13 +1017,13 @@ async def _migrate_one(
         else []
     )
     raw_ttl = meta.get("ttl")
-    # Normalize ttl the same way the create handler does:
-    # ``""``/whitespace-only collapses to ``None`` so we don't
-    # persist an empty-string TTL that the type system reads as
-    # "has TTL".
-    ttl: Optional[str] = (
-        (str(raw_ttl).strip() or None) if raw_ttl is not None else None
-    )
+    # Match ``handle_artifact_create``'s normalization exactly:
+    # ``str(raw or "").strip() or None``. Anything falsey
+    # (including ``0`` / ``False`` / ``""`` / whitespace-only)
+    # collapses to ``None`` so we don't persist invalid TTLs
+    # like the literal string ``"0"`` or ``"False"`` that the
+    # type system would read as "has TTL".
+    ttl: Optional[str] = str(raw_ttl or "").strip() or None
     try:
         result = await target.create(
             kind=kind,
