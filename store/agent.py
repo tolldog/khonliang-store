@@ -212,15 +212,15 @@ class StoreAgent(BaseAgent):
         entry_points=[
             WelcomeEntryPoint(
                 skill="artifact_create",
-                when_to_use="persist any payload (large diff, test output, JSON, markdown) to local SQLite — returns a stable artifact_id",
+                when_to_use="persist any payload (large diff, test output, JSON, markdown) — returns a stable artifact_id; requires a write-capable backend (artifacts.backend = local|composite)",
             ),
             WelcomeEntryPoint(
                 skill="artifact_get",
-                when_to_use="fetch artifact content (clamped to HARD_MAX_CHARS=20000); returns truncated=true when the body exceeds the cap",
+                when_to_use="fetch artifact content (clamped to HARD_MAX_CHARS); returns truncated=true when the body exceeds the cap",
             ),
             WelcomeEntryPoint(
                 skill="artifact_list",
-                when_to_use="browse with filters (kind, producer, session_id, trace_id); newest-first ordering",
+                when_to_use="browse with filters (kind, producer, session_id); newest-first ordering",
             ),
             WelcomeEntryPoint(
                 skill="display",
