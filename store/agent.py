@@ -46,7 +46,7 @@ import sys
 from typing import Any, Optional, Tuple
 
 import yaml
-from khonliang_bus import BaseAgent, Skill, handler
+from khonliang_bus import BaseAgent, Skill, Welcome, WelcomeEntryPoint, handler
 
 from store.artifacts import ArtifactBackend, BusBackedArtifactStore
 from store.composite import CompositeArtifactBackend
@@ -192,6 +192,46 @@ class StoreAgent(BaseAgent):
     around the bus REST routes, Phase 4 will swap in a local
     SQLite implementation that owns the data.
     """
+
+    # Cold-start orientation surface (fr_khonliang-bus-lib_6a82732c).
+    WELCOME = Welcome(
+        role="artifact backend + viewer authority",
+        mission=(
+            "Owns durable artifact storage — metadata, content, "
+            "hash-immutable records — and a browser-rendered viewer for "
+            "ad-hoc inspection. Migrating from the bus's legacy artifact "
+            "REST surface to local SQLite via a composite read fallback. "
+            "Future backends (S3, GCS, network FS) plug into the "
+            "ArtifactBackend ABC without consumer changes."
+        ),
+        not_responsible_for=[
+            "FR / spec / milestone state (developer)",
+            "corpus + knowledge store + concept graph (researcher)",
+            "code review (reviewer)",
+        ],
+        entry_points=[
+            WelcomeEntryPoint(
+                skill="artifact_create",
+                when_to_use="persist any payload (large diff, test output, JSON, markdown) — returns a stable artifact_id; requires a write-capable backend (artifacts.backend = local|composite)",
+            ),
+            WelcomeEntryPoint(
+                skill="artifact_get",
+                when_to_use="fetch artifact content (clamped to HARD_MAX_CHARS); returns truncated=true when the body exceeds the cap",
+            ),
+            WelcomeEntryPoint(
+                skill="artifact_list",
+                when_to_use="browse with filters (kind, producer, session_id); newest-first ordering",
+            ),
+            WelcomeEntryPoint(
+                skill="display",
+                when_to_use="lazily start a browser-rendered tabbed viewer for one or more artifacts; returns a URL",
+            ),
+            WelcomeEntryPoint(
+                skill="artifact_grep",
+                when_to_use="bounded pattern excerpts with context_lines around each match",
+            ),
+        ],
+    )
 
     agent_id = "store-primary"
     agent_type = "store"
