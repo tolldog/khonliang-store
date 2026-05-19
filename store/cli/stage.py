@@ -51,7 +51,16 @@ def staging_root() -> Path:
 
 def _capture_staged_diff(cwd: Path) -> bytes:
     proc = subprocess.run(
-        ["git", "-C", str(cwd), "diff", "--cached"],
+        [
+            "git",
+            "-C",
+            str(cwd),
+            "diff",
+            "--cached",
+            "--no-color",
+            "--no-ext-diff",
+            "--binary",
+        ],
         capture_output=True,
         check=False,
     )
@@ -63,30 +72,57 @@ def _capture_staged_diff(cwd: Path) -> bytes:
     return proc.stdout
 
 
+_BUNDLE_DIR_MODE = 0o2750  # setgid + rwx for owner, rx for group, none for other
+_BUNDLE_FILE_MODE = 0o640  # rw for owner, r for group, none for other
+
+
 def _write_fs_bundle(kind: str, files: dict[str, bytes], *, root: Path) -> str:
+    """Write a bundle dir under ``root`` atomically.
+
+    Bundle is built under ``<root>/.tmp-<uuid>/`` first and renamed to
+    ``<root>/<uuid>/`` only after every file is written, so a partial
+    write (disk full, interrupt, perm error) never leaves a half-built
+    bundle that a consumer might pick up.
+
+    Permissions are set explicitly rather than letting the process
+    umask leak the bundle world-readable: dirs are ``2750`` (setgid so
+    child files inherit the parent group), files are ``0640``.
+    """
     root.mkdir(parents=True, exist_ok=True)
     bundle_id = str(uuid.uuid4())
-    bundle_dir = root / bundle_id
-    bundle_dir.mkdir(parents=False, exist_ok=False)
-    manifest = {
-        "kind": kind,
-        "created_at": time.time(),
-        "files": sorted(files.keys()),
-    }
-    (bundle_dir / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    for name, content in files.items():
-        target = bundle_dir / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
+    tmp_dir = root / f".tmp-{bundle_id}"
+    final_dir = root / bundle_id
+    tmp_dir.mkdir(parents=False, exist_ok=False)
+    try:
+        os.chmod(tmp_dir, _BUNDLE_DIR_MODE)
+        manifest = {
+            "kind": kind,
+            "created_at": time.time(),
+            "files": sorted(files.keys()),
+        }
+        manifest_path = tmp_dir / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(manifest_path, _BUNDLE_FILE_MODE)
+        for name, content in files.items():
+            target = tmp_dir / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            os.chmod(target, _BUNDLE_FILE_MODE)
+        os.rename(tmp_dir, final_dir)
+    except BaseException:
+        # Best-effort cleanup; re-raise so the caller sees the real failure.
+        import shutil
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
     return bundle_id
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="kh-stage",
         description=(
             "Stage byte-shaped agent inputs and emit a routable handle "
             "(<backend>:<id>) on stdout. See fr_khonliang-bus-lib_520ce3bf."
