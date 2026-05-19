@@ -207,10 +207,13 @@ def test_git_diff_invoked_with_deterministic_flags(
 
 
 def test_bundle_permissions_are_restrictive(tmp_path: Path, monkeypatch, capsys) -> None:
-    """Bundle dir must be 02750 and bundle files 0640 — group-readable,
-    not world-readable. Otherwise the documented permission model
-    (parent ``/var/lib/khonliang/staging/`` group-permissioned 2770)
-    leaks bundle content to any local user.
+    """Three distinct modes in the documented model:
+
+    - staging root: ``2770`` (group-writable so multiple users in the
+      ``khonliang`` group can each create their own bundle).
+    - bundle dir:   ``2750`` (group-readable only; only the bundle
+      owner writes inside).
+    - bundle files: ``0640`` (group-readable only).
     """
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -224,12 +227,50 @@ def test_bundle_permissions_are_restrictive(tmp_path: Path, monkeypatch, capsys)
     bundle_id = handle.split(":", 1)[1]
     bundle_dir = staging / bundle_id
 
+    root_mode = stat_mod.S_IMODE(staging.stat().st_mode)
+    assert root_mode == 0o2770, f"staging root mode {oct(root_mode)} != 0o2770"
+
     dir_mode = stat_mod.S_IMODE(bundle_dir.stat().st_mode)
     assert dir_mode == 0o2750, f"bundle dir mode {oct(dir_mode)} != 0o2750"
 
     for entry in bundle_dir.iterdir():
         f_mode = stat_mod.S_IMODE(entry.stat().st_mode)
         assert f_mode == 0o640, f"{entry.name} mode {oct(f_mode)} != 0o640"
+
+
+def test_file_creation_immune_to_restrictive_umask(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Pass-3 finding: ``os.open(mode=0o640)`` is still masked by the
+    process umask. A caller running with a restrictive umask (e.g.
+    ``0o077``) would silently strip the group-read bit and break the
+    group-readable contract. The fix wraps the file opens in
+    ``_no_umask()``; this test pins it by setting umask to ``0o077``
+    before invoking ``main()`` and asserting the bundle files still
+    end up at exactly ``0o640``.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    staging = tmp_path / "staging"
+    monkeypatch.setenv(stage.ENV_STAGING_ROOT, str(staging))
+
+    prev_umask = os.umask(0o077)
+    try:
+        rc = stage.main(["--diff", "--cwd", str(repo)])
+    finally:
+        os.umask(prev_umask)
+    assert rc == stage.EXIT_OK
+    handle = capsys.readouterr().out.strip()
+    bundle_id = handle.split(":", 1)[1]
+    bundle_dir = staging / bundle_id
+
+    for entry in bundle_dir.iterdir():
+        f_mode = stat_mod.S_IMODE(entry.stat().st_mode)
+        assert f_mode == 0o640, (
+            f"{entry.name} mode {oct(f_mode)} != 0o640 — opener mode "
+            "was masked by the caller umask, breaking group-readable"
+        )
 
 
 def test_rename_failure_leaves_no_orphan(

@@ -74,7 +74,11 @@ def _capture_staged_diff(cwd: Path) -> bytes:
     return proc.stdout
 
 
-_BUNDLE_DIR_MODE = 0o2750  # setgid + rwx for owner, rx for group, none for other
+_STAGING_ROOT_MODE = 0o2770  # setgid + rwx for owner+group: any user in the
+# khonliang group can create their own bundle under here (matches the
+# documented install mode for /var/lib/khonliang/staging/).
+_BUNDLE_DIR_MODE = 0o2750  # setgid + rwx for owner, rx for group: the bundle
+# itself is owner-write only; the service-user reads via group membership.
 _BUNDLE_FILE_MODE = 0o640  # rw for owner, r for group, none for other
 
 
@@ -118,16 +122,38 @@ def _write_fs_bundle(kind: str, files: dict[str, bytes], *, root: Path) -> str:
     bundle that a consumer might pick up.
 
     Permissions are applied at create time — not post-hoc via
-    ``chmod`` — to eliminate the briefly-world-readable window: dirs
-    are created at ``2750`` (setgid so child files inherit the parent
-    group) under a suspended umask; files are created at ``0640`` via
-    an ``os.open`` opener.
+    ``chmod`` — to eliminate the briefly-world-readable window:
+
+    - The root dir, when this function has to bootstrap it, is created
+      at ``2770`` so any user in the ``khonliang`` group can stage
+      their own bundles (matches the documented install mode for
+      ``/var/lib/khonliang/staging/``). In production the install
+      step or tmpfiles.d has already created it; this branch is for
+      dev/test where ``KHONLIANG_STAGING_ROOT`` points at a tmp dir.
+    - Bundle dirs themselves are created at ``2750``: owner writes,
+      service-user reads via the inherited group.
+    - Bundle files are created at ``0640`` via ``os.open`` with
+      ``mode=...``. Both the dir mkdir and the file open run under
+      ``_no_umask()`` because ``os.open(mode=...)`` is still subject
+      to the process umask — without suspension a restrictive caller
+      umask (e.g. ``0o077``) would strip the group bit at create time
+      and break the group-readable contract.
     """
     with _no_umask():
-        root.mkdir(mode=_BUNDLE_DIR_MODE, parents=True, exist_ok=True)
+        root_existed = root.exists()
+        root.mkdir(mode=_STAGING_ROOT_MODE, parents=True, exist_ok=True)
+        if not root_existed:
+            # Same setgid-bit-stripping behavior as the bundle dir
+            # mkdir below; re-apply via chmod. Skip when the root
+            # already existed so we don't overwrite a deliberately-
+            # different mode on the production root (the install
+            # script owns root permissions).
+            os.chmod(root, _STAGING_ROOT_MODE)
     bundle_id = str(uuid.uuid4())
     tmp_dir = root / f".tmp-{bundle_id}"
     final_dir = root / bundle_id
+    # Suspend umask for the entire bundle write — mkdir AND every file
+    # open need umask=0 for their mode args to land verbatim.
     with _no_umask():
         os.mkdir(tmp_dir, mode=_BUNDLE_DIR_MODE)
         # ``mkdir(2)`` is allowed by POSIX to silently strip the
@@ -139,33 +165,32 @@ def _write_fs_bundle(kind: str, files: dict[str, bytes], *, root: Path) -> str:
         # documented; the gap is empty in practice (this function is
         # the only writer to its own temp dir) but the call is cheap.
         os.chmod(tmp_dir, _BUNDLE_DIR_MODE)
-    try:
-        manifest = {
-            "kind": kind,
-            "created_at": time.time(),
-            "files": sorted(files.keys()),
-        }
-        with open(
-            tmp_dir / "manifest.json",
-            "w",
-            encoding="utf-8",
-            opener=_restrictive_opener,
-        ) as mf:
-            mf.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-        for name, content in files.items():
-            target = tmp_dir / name
-            if target.parent != tmp_dir:
-                with _no_umask():
+        try:
+            manifest = {
+                "kind": kind,
+                "created_at": time.time(),
+                "files": sorted(files.keys()),
+            }
+            with open(
+                tmp_dir / "manifest.json",
+                "w",
+                encoding="utf-8",
+                opener=_restrictive_opener,
+            ) as mf:
+                mf.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+            for name, content in files.items():
+                target = tmp_dir / name
+                if target.parent != tmp_dir:
                     target.parent.mkdir(
                         mode=_BUNDLE_DIR_MODE, parents=True, exist_ok=True
                     )
-            with open(target, "wb", opener=_restrictive_opener) as f:
-                f.write(content)
-        os.rename(tmp_dir, final_dir)
-    except BaseException:
-        # Best-effort cleanup; re-raise so the caller sees the real failure.
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise
+                with open(target, "wb", opener=_restrictive_opener) as f:
+                    f.write(content)
+            os.rename(tmp_dir, final_dir)
+        except BaseException:
+            # Best-effort cleanup; re-raise so the caller sees the real failure.
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
     return bundle_id
 
 
