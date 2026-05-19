@@ -28,14 +28,16 @@ See ``fr_khonliang-bus-lib_520ce3bf`` (this CLI) and
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 DEFAULT_STAGING_ROOT = Path("/var/lib/khonliang/staging")
 ENV_STAGING_ROOT = "KHONLIANG_STAGING_ROOT"
@@ -76,46 +78,92 @@ _BUNDLE_DIR_MODE = 0o2750  # setgid + rwx for owner, rx for group, none for othe
 _BUNDLE_FILE_MODE = 0o640  # rw for owner, r for group, none for other
 
 
+@contextlib.contextmanager
+def _no_umask() -> Iterator[None]:
+    """Run with umask=0 so explicit mkdir/open mode bits land verbatim.
+
+    Without this, ``os.mkdir(path, mode=0o2750)`` under a typical
+    ``0o022`` umask still drops world bits at *create* time — fine
+    when the explicit mode already excludes them — but more dangerous
+    is the opposite case: a restrictive process umask (e.g. ``0o077``)
+    would silently strip the group ``rx`` we *want* to keep, breaking
+    the documented group-readable model. Suspending umask makes the
+    mode arg the single source of truth.
+
+    Process-global / not thread-safe; acceptable for a one-shot CLI.
+    """
+    prev = os.umask(0o000)
+    try:
+        yield
+    finally:
+        os.umask(prev)
+
+
+def _restrictive_opener(file: str, flags: int) -> int:
+    """``open(..., opener=...)`` hook that creates files at ``0640``.
+
+    Setting the mode at ``os.open`` time (rather than after a default
+    ``0o666 & ~umask`` create + later ``chmod``) closes the
+    briefly-world-readable window flagged by review.
+    """
+    return os.open(file, flags, _BUNDLE_FILE_MODE)
+
+
 def _write_fs_bundle(kind: str, files: dict[str, bytes], *, root: Path) -> str:
-    """Write a bundle dir under ``root`` atomically.
+    """Write a bundle dir under ``root`` atomically with restrictive perms.
 
     Bundle is built under ``<root>/.tmp-<uuid>/`` first and renamed to
     ``<root>/<uuid>/`` only after every file is written, so a partial
     write (disk full, interrupt, perm error) never leaves a half-built
     bundle that a consumer might pick up.
 
-    Permissions are set explicitly rather than letting the process
-    umask leak the bundle world-readable: dirs are ``2750`` (setgid so
-    child files inherit the parent group), files are ``0640``.
+    Permissions are applied at create time — not post-hoc via
+    ``chmod`` — to eliminate the briefly-world-readable window: dirs
+    are created at ``2750`` (setgid so child files inherit the parent
+    group) under a suspended umask; files are created at ``0640`` via
+    an ``os.open`` opener.
     """
-    root.mkdir(parents=True, exist_ok=True)
+    with _no_umask():
+        root.mkdir(mode=_BUNDLE_DIR_MODE, parents=True, exist_ok=True)
     bundle_id = str(uuid.uuid4())
     tmp_dir = root / f".tmp-{bundle_id}"
     final_dir = root / bundle_id
-    tmp_dir.mkdir(parents=False, exist_ok=False)
-    try:
+    with _no_umask():
+        os.mkdir(tmp_dir, mode=_BUNDLE_DIR_MODE)
+        # ``mkdir(2)`` is allowed by POSIX to silently strip the
+        # setgid bit, and Linux usually does. The world bits are
+        # already excluded by ``_BUNDLE_DIR_MODE``, so the only
+        # "before chmod" gap is the setgid bit (group inheritance) —
+        # not any read/write access. Re-apply via ``chmod`` so files
+        # written under this dir inherit the parent group as
+        # documented; the gap is empty in practice (this function is
+        # the only writer to its own temp dir) but the call is cheap.
         os.chmod(tmp_dir, _BUNDLE_DIR_MODE)
+    try:
         manifest = {
             "kind": kind,
             "created_at": time.time(),
             "files": sorted(files.keys()),
         }
-        manifest_path = tmp_dir / "manifest.json"
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        with open(
+            tmp_dir / "manifest.json",
+            "w",
             encoding="utf-8",
-        )
-        os.chmod(manifest_path, _BUNDLE_FILE_MODE)
+            opener=_restrictive_opener,
+        ) as mf:
+            mf.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         for name, content in files.items():
             target = tmp_dir / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
-            os.chmod(target, _BUNDLE_FILE_MODE)
+            if target.parent != tmp_dir:
+                with _no_umask():
+                    target.parent.mkdir(
+                        mode=_BUNDLE_DIR_MODE, parents=True, exist_ok=True
+                    )
+            with open(target, "wb", opener=_restrictive_opener) as f:
+                f.write(content)
         os.rename(tmp_dir, final_dir)
     except BaseException:
         # Best-effort cleanup; re-raise so the caller sees the real failure.
-        import shutil
-
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
     return bundle_id
@@ -211,11 +259,21 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
         return EXIT_USER_ERROR
 
-    bundle_id = _write_fs_bundle(
-        kind="diff",
-        files={"diff.patch": diff_bytes},
-        root=staging_root(),
-    )
+    try:
+        bundle_id = _write_fs_bundle(
+            kind="diff",
+            files={"diff.patch": diff_bytes},
+            root=staging_root(),
+        )
+    except OSError as exc:
+        # Stable script-friendly envelope for the common filesystem
+        # failure modes: PermissionError (caller not in khonliang
+        # group, or staging root unwritable), FileExistsError (UUID
+        # collision — astronomically unlikely but cheaper than a
+        # traceback if it ever happens), disk-full, rename-across-
+        # filesystems, etc. Truly unexpected exceptions still bubble.
+        print(f"kh-stage: bundle write failed: {exc}", file=sys.stderr)
+        return EXIT_USER_ERROR
     print(f"fs:{bundle_id}")
     return EXIT_OK
 

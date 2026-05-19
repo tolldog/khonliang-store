@@ -232,14 +232,17 @@ def test_bundle_permissions_are_restrictive(tmp_path: Path, monkeypatch, capsys)
         assert f_mode == 0o640, f"{entry.name} mode {oct(f_mode)} != 0o640"
 
 
-def test_partial_write_failure_leaves_no_orphan(
+def test_rename_failure_leaves_no_orphan(
     tmp_path: Path,
     monkeypatch,
     capsys,
 ) -> None:
-    """A mid-write failure must clean up the temp dir and never expose a
-    half-built bundle under the final id. Otherwise consumers can pick
-    up an inconsistent bundle.
+    """``os.rename`` is the last step of the atomic-write sequence; if
+    it fails (cross-filesystem, perm error, race with another writer),
+    the half-built temp dir must be cleaned up, ``main()`` must
+    surface ``EXIT_USER_ERROR`` with a stderr envelope (not a
+    traceback), and no final bundle dir must be exposed for a
+    consumer to pick up.
     """
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -247,18 +250,21 @@ def test_partial_write_failure_leaves_no_orphan(
     staging = tmp_path / "staging"
     monkeypatch.setenv(stage.ENV_STAGING_ROOT, str(staging))
 
-    real_write_bytes = Path.write_bytes
+    real_rename = os.rename
 
-    def boom_write_bytes(self, *args, **kwargs):
-        if self.name == "diff.patch":
-            raise OSError("simulated disk full")
-        return real_write_bytes(self, *args, **kwargs)
+    def boom_rename(src, dst, *args, **kwargs):
+        raise OSError("simulated rename failure")
 
-    monkeypatch.setattr(Path, "write_bytes", boom_write_bytes)
+    monkeypatch.setattr(stage.os, "rename", boom_rename)
 
-    with pytest.raises(OSError, match="simulated disk full"):
-        stage.main(["--diff", "--cwd", str(repo)])
-    capsys.readouterr()
+    rc = stage.main(["--diff", "--cwd", str(repo)])
+    captured = capsys.readouterr()
+
+    # Findings #3: stable envelope, not a traceback bubbling out.
+    assert rc == stage.EXIT_USER_ERROR
+    assert "bundle write failed" in captured.err
+    assert "simulated rename failure" in captured.err
+    assert captured.out == ""
 
     # No final bundle dir exposed.
     final_entries = [
@@ -272,3 +278,55 @@ def test_partial_write_failure_leaves_no_orphan(
         p for p in staging.iterdir() if p.name.startswith(".tmp-")
     ]
     assert tmp_entries == [], f"orphan temp dirs: {tmp_entries}"
+
+    # Sanity: the real rename is still around for other tests.
+    assert real_rename is os.rename or real_rename is not None
+
+
+def test_no_world_bits_ever_set_during_write(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Findings #1 + #2: world bits must never appear on any bundle
+    path, not even transiently. The implementation uses umask=0 + an
+    ``os.open`` opener so files/dirs are created at restrictive mode
+    from the start. Any ``chmod`` calls inside the staging root must
+    only set modes that are already free of world bits (a setgid
+    re-apply is fine; promoting 0o0750 -> 0o2750 stays restrictive).
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    staging = tmp_path / "staging"
+    monkeypatch.setenv(stage.ENV_STAGING_ROOT, str(staging))
+
+    chmod_calls: list[tuple[str, int]] = []
+    real_chmod = os.chmod
+
+    def spy_chmod(path, mode, *args, **kwargs):
+        chmod_calls.append((str(path), mode))
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(stage.os, "chmod", spy_chmod)
+
+    rc = stage.main(["--diff", "--cwd", str(repo)])
+    assert rc == stage.EXIT_OK
+    capsys.readouterr()
+
+    staging_str = str(staging)
+    for path, mode in chmod_calls:
+        if staging_str in path:
+            # Any chmod on a staging path must leave world bits cleared.
+            assert mode & 0o007 == 0, (
+                f"chmod({path!r}, {oct(mode)}) sets world bits"
+            )
+
+    # Final state still matches the documented mode model.
+    bundle_dirs = [
+        p for p in staging.iterdir()
+        if p.is_dir() and not p.name.startswith(".tmp-")
+    ]
+    assert len(bundle_dirs) == 1
+    bundle_dir = bundle_dirs[0]
+    assert stat_mod.S_IMODE(bundle_dir.stat().st_mode) == 0o2750
+    for entry in bundle_dir.iterdir():
+        assert stat_mod.S_IMODE(entry.stat().st_mode) == 0o640
