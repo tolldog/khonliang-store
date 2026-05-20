@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat as stat_mod
 import subprocess
 from pathlib import Path
@@ -16,6 +17,15 @@ from pathlib import Path
 import pytest
 
 from store.cli import stage
+
+# Skip the whole suite when git is absent (minimal CI images, some
+# containers). The implementation handles missing-git as a clean
+# user-facing error (see ``test_capture_staged_diff_handles_missing_git``),
+# but the rest of the suite needs git to spin up real repos.
+pytestmark = pytest.mark.skipif(
+    shutil.which("git") is None,
+    reason="git not on PATH; kh-stage tests need a real git repo",
+)
 
 
 def _init_repo(path: Path) -> None:
@@ -236,6 +246,62 @@ def test_bundle_permissions_are_restrictive(tmp_path: Path, monkeypatch, capsys)
     for entry in bundle_dir.iterdir():
         f_mode = stat_mod.S_IMODE(entry.stat().st_mode)
         assert f_mode == 0o640, f"{entry.name} mode {oct(f_mode)} != 0o640"
+
+
+def test_empty_env_var_falls_through_to_default(monkeypatch) -> None:
+    """Pass-4 finding: an *empty* KHONLIANG_STAGING_ROOT (rather than
+    *unset*) used to resolve to ``Path('')`` which means CWD — a
+    footgun for shell scripts that pass through an unset var as ''.
+    Treat empty as unset; fall through to DEFAULT_STAGING_ROOT.
+    """
+    monkeypatch.setenv(stage.ENV_STAGING_ROOT, "")
+    assert stage.staging_root() == stage.DEFAULT_STAGING_ROOT
+
+
+def test_capture_staged_diff_handles_missing_git(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Pass-4 finding: ``git`` missing from PATH must surface as
+    ``EXIT_USER_ERROR`` + stderr envelope, not a traceback. The CLI
+    runs in minimal containers and CI images where git may be absent.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv(stage.ENV_STAGING_ROOT, str(tmp_path / "staging"))
+    # Make ``git`` lookup fail by pointing PATH at an empty dir.
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    monkeypatch.setenv("PATH", str(empty_bin))
+
+    rc = stage.main(["--diff", "--cwd", str(repo)])
+    captured = capsys.readouterr()
+
+    assert rc == stage.EXIT_USER_ERROR
+    assert "git executable not found" in captured.err
+    assert captured.out == ""
+
+
+def test_write_fs_bundle_rejects_nested_path_keys(tmp_path: Path) -> None:
+    """Pass-4 finding: nested-dir setgid bit would be silently
+    stripped if ``files`` keys included path separators. Reject up
+    front so future depth modes (changed-files / module / repo /
+    with-context) are forced to add real nested-dir handling rather
+    than silently inheriting broken behavior.
+    """
+    root = tmp_path / "staging"
+    with pytest.raises(ValueError, match="nested paths"):
+        stage._write_fs_bundle(
+            kind="diff",
+            files={"files/foo.py": b"x"},
+            root=root,
+        )
+    # Sanity: also reject Windows-style separators.
+    with pytest.raises(ValueError, match="nested paths"):
+        stage._write_fs_bundle(
+            kind="diff",
+            files={"sub\\bar.py": b"x"},
+            root=root,
+        )
 
 
 def test_file_creation_immune_to_restrictive_umask(

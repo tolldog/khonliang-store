@@ -48,24 +48,53 @@ EXIT_NOT_IMPLEMENTED = 2
 
 
 def staging_root() -> Path:
-    return Path(os.environ.get(ENV_STAGING_ROOT, str(DEFAULT_STAGING_ROOT)))
+    """Return the active staging root.
+
+    An *empty* ``KHONLIANG_STAGING_ROOT`` is treated as **unset** and
+    falls through to the default. ``Path("")`` resolves to the current
+    working directory, which would silently scatter bundles into
+    whatever dir the caller happened to be in — a real footgun for
+    shell scripts that pass through an unset env var as the empty
+    string.
+    """
+    raw = os.environ.get(ENV_STAGING_ROOT, "")
+    if raw == "":
+        return DEFAULT_STAGING_ROOT
+    return Path(raw)
 
 
 def _capture_staged_diff(cwd: Path) -> bytes:
-    proc = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(cwd),
-            "diff",
-            "--cached",
-            "--no-color",
-            "--no-ext-diff",
-            "--binary",
-        ],
-        capture_output=True,
-        check=False,
-    )
+    """Run ``git diff --cached`` at ``cwd`` and return the raw bytes.
+
+    Raises :class:`RuntimeError` for both git-not-found (FileNotFoundError)
+    and any other ``OSError`` so that ``main()``'s single ``RuntimeError``
+    branch surfaces a clean ``kh-stage:`` envelope on stderr instead of
+    a traceback. The git-not-installed case in particular is common in
+    minimal containers and CI images, and a traceback there is hostile.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(cwd),
+                "diff",
+                "--cached",
+                "--no-color",
+                "--no-ext-diff",
+                "--binary",
+            ],
+            capture_output=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"git executable not found on PATH: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"git subprocess failed to start at {cwd}: {exc}"
+        ) from exc
     if proc.returncode != 0:
         raise RuntimeError(
             f"git diff --cached failed ({proc.returncode}) at {cwd}: "
@@ -179,11 +208,26 @@ def _write_fs_bundle(kind: str, files: dict[str, bytes], *, root: Path) -> str:
             ) as mf:
                 mf.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
             for name, content in files.items():
-                target = tmp_dir / name
-                if target.parent != tmp_dir:
-                    target.parent.mkdir(
-                        mode=_BUNDLE_DIR_MODE, parents=True, exist_ok=True
+                # Today (--diff only), ``files`` is always
+                # ``{"diff.patch": ...}`` — no separators. A previous
+                # iteration had a conditional nested-dir mkdir for the
+                # future richer modes (changed-files / module / repo /
+                # with-context, see fr_khonliang-bus-lib_520ce3bf), but
+                # that branch was dead code AND silently broken: the
+                # nested mkdir would have lost setgid via mkdir(2)'s
+                # POSIX-undefined behavior with no chmod follow-up,
+                # breaking the group-inheritance contract for files
+                # written under nested paths. Reject separators up
+                # front; when nested layouts ship, the writer of that
+                # mode is responsible for adding back proper nested
+                # mkdir + chmod handling (and tests).
+                if "/" in name or "\\" in name:
+                    raise ValueError(
+                        f"_write_fs_bundle: nested paths in `files` are "
+                        f"not supported yet (got {name!r}); see "
+                        "fr_khonliang-bus-lib_520ce3bf changed-files mode"
                     )
+                target = tmp_dir / name
                 with open(target, "wb", opener=_restrictive_opener) as f:
                     f.write(content)
             os.rename(tmp_dir, final_dir)
