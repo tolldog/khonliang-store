@@ -170,7 +170,17 @@ def _write_fs_bundle(kind: str, files: dict[str, bytes], *, root: Path) -> str:
     """
     with _no_umask():
         root_existed = root.exists()
-        root.mkdir(mode=_STAGING_ROOT_MODE, parents=True, exist_ok=True)
+        # NOTE: no ``parents=True``. ``pathlib.Path.mkdir(parents=True)``
+        # creates intermediate dirs with the default ``mode=0o777``
+        # (the mode arg only applies to the leaf), and under
+        # ``_no_umask()`` umask=0 means those intermediates land
+        # world-writable. Require the parent to exist instead — in
+        # production the install script provisions the whole path,
+        # and in dev/test ``tmp_path`` is always the immediate
+        # parent. A missing parent surfaces as ``FileNotFoundError``
+        # which ``main()`` catches as ``OSError`` → clean
+        # ``EXIT_USER_ERROR`` envelope rather than a silent footgun.
+        root.mkdir(mode=_STAGING_ROOT_MODE, exist_ok=True)
         if not root_existed:
             # Same setgid-bit-stripping behavior as the bundle dir
             # mkdir below; re-apply via chmod. Skip when the root

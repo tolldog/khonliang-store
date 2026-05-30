@@ -18,13 +18,15 @@ import pytest
 
 from store.cli import stage
 
-# Skip the whole suite when git is absent (minimal CI images, some
-# containers). The implementation handles missing-git as a clean
-# user-facing error (see ``test_capture_staged_diff_handles_missing_git``),
-# but the rest of the suite needs git to spin up real repos.
-pytestmark = pytest.mark.skipif(
+# Per-test skip for tests that need a real git repo. Applied as a
+# decorator (not module-level ``pytestmark``) so the suite still
+# exercises the tests that don't need git on minimal CI images — in
+# particular ``test_capture_staged_diff_handles_missing_git``, which
+# explicitly hides ``git`` via PATH and is most valuable to run when
+# the host genuinely lacks git.
+needs_git = pytest.mark.skipif(
     shutil.which("git") is None,
-    reason="git not on PATH; kh-stage tests need a real git repo",
+    reason="git not on PATH; this test needs a real git repo",
 )
 
 
@@ -53,6 +55,7 @@ def _init_repo(path: Path) -> None:
     subprocess.run(["git", "-C", str(path), "add", "README"], check=True)
 
 
+@needs_git
 def test_diff_fs_happy_path(tmp_path: Path, monkeypatch, capsys) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -84,6 +87,7 @@ def test_diff_fs_happy_path(tmp_path: Path, monkeypatch, capsys) -> None:
     assert b"--- a/README" in diff_bytes
 
 
+@needs_git
 def test_empty_staged_diff_rejects(tmp_path: Path, monkeypatch, capsys) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -107,6 +111,7 @@ def test_empty_staged_diff_rejects(tmp_path: Path, monkeypatch, capsys) -> None:
     assert captured.out == ""
 
 
+@needs_git
 def test_non_git_cwd_rejects(tmp_path: Path, monkeypatch, capsys) -> None:
     not_a_repo = tmp_path / "plain"
     not_a_repo.mkdir()
@@ -133,6 +138,7 @@ def test_store_backend_not_implemented(tmp_path: Path, monkeypatch, capsys) -> N
     assert captured.out == ""
 
 
+@needs_git
 @pytest.mark.parametrize(
     "depth_flag",
     ["--changed-files", "--module", "--repo", "--with-context"],
@@ -162,6 +168,7 @@ def test_missing_depth_flag_argparse_error(tmp_path: Path, capsys) -> None:
     assert exc_info.value.code != 0
 
 
+@needs_git
 def test_handle_format_is_uuid(tmp_path: Path, monkeypatch, capsys) -> None:
     """fs:<id> id should parse as a UUID — reviewer-side resolver will rely on it."""
     import uuid as _uuid
@@ -179,6 +186,7 @@ def test_handle_format_is_uuid(tmp_path: Path, monkeypatch, capsys) -> None:
     _uuid.UUID(bundle_id)
 
 
+@needs_git
 def test_git_diff_invoked_with_deterministic_flags(
     tmp_path: Path,
     monkeypatch,
@@ -216,6 +224,7 @@ def test_git_diff_invoked_with_deterministic_flags(
     assert "--binary" in git_argv
 
 
+@needs_git
 def test_bundle_permissions_are_restrictive(tmp_path: Path, monkeypatch, capsys) -> None:
     """Three distinct modes in the documented model:
 
@@ -281,6 +290,29 @@ def test_capture_staged_diff_handles_missing_git(
     assert captured.out == ""
 
 
+def test_missing_parent_dir_fails_cleanly_no_world_writable_intermediates(
+    tmp_path: Path,
+) -> None:
+    """Pass-5 finding: ``pathlib.Path.mkdir(parents=True)`` only applies
+    the mode arg to the leaf — intermediates are created at the default
+    ``0o777``, and under ``_no_umask()`` that lands as world-writable
+    intermediate dirs. Fix dropped ``parents=True``; this test pins
+    that behavior by passing a deeply-nested root whose parents don't
+    exist and asserting the call fails with ``FileNotFoundError``
+    (not a silent ``mkdir -p`` of world-writable scaffolding).
+    """
+    nested_root = tmp_path / "a" / "b" / "c" / "staging"
+    assert not nested_root.parent.exists()
+    with pytest.raises(FileNotFoundError):
+        stage._write_fs_bundle(
+            kind="diff",
+            files={"diff.patch": b"x"},
+            root=nested_root,
+        )
+    # Critically: no intermediate scaffolding was created.
+    assert not (tmp_path / "a").exists()
+
+
 def test_write_fs_bundle_rejects_nested_path_keys(tmp_path: Path) -> None:
     """Pass-4 finding: nested-dir setgid bit would be silently
     stripped if ``files`` keys included path separators. Reject up
@@ -304,6 +336,7 @@ def test_write_fs_bundle_rejects_nested_path_keys(tmp_path: Path) -> None:
         )
 
 
+@needs_git
 def test_file_creation_immune_to_restrictive_umask(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
@@ -339,6 +372,7 @@ def test_file_creation_immune_to_restrictive_umask(
         )
 
 
+@needs_git
 def test_rename_failure_leaves_no_orphan(
     tmp_path: Path,
     monkeypatch,
@@ -390,6 +424,7 @@ def test_rename_failure_leaves_no_orphan(
     assert real_rename is os.rename or real_rename is not None
 
 
+@needs_git
 def test_no_world_bits_ever_set_during_write(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
