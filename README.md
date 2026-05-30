@@ -55,6 +55,48 @@ Tracked under `fr_store_ef668d56` (composite + migration),
   `fr_researcher_000ad07c`'s `stage_payload` / `ingest_from_artifact`
   through the store once writes land.
 
+## User-side CLIs
+
+- **`kh-stage`** — captures byte-shaped agent inputs (currently
+  `git diff --cached` via `--diff`; `--changed-files`, `--module`,
+  `--repo`, `--with-context` are reserved depth flags wired today
+  but not yet implemented) and writes a bundle to
+  `/var/lib/khonliang/staging/<uuid>/`. Prints a routable handle
+  `fs:<uuid>` on stdout. Reviewer (and other agents) resolve the
+  handle on their side, so the bytes never travel through the
+  caller's MCP context.
+  Tracked under `fr_khonliang-bus-lib_520ce3bf` (retargeted to
+  this repo) and `fr_reviewer_800e851d` (matching consumer).
+
+  Install steps (one-time, run as root):
+  ```bash
+  # 1. Create the staging dir with setgid bit so bundles inherit the group
+  install -d -o root -g khonliang -m 2770 /var/lib/khonliang/staging
+
+  # 2. Drop a tmpfiles.d snippet so stale bundles cleanup after 1 day
+  cat >/etc/tmpfiles.d/khonliang-staging.conf <<'EOF'
+  d /var/lib/khonliang/staging 2770 root khonliang 1d
+  EOF
+  systemd-tmpfiles --create /etc/tmpfiles.d/khonliang-staging.conf
+
+  # 3. Add the human user to the khonliang group (then re-login)
+  usermod -aG khonliang <username>
+  ```
+
+  Override the staging root via `KHONLIANG_STAGING_ROOT` env var
+  (useful for tests and dev). Service users that read the bundles
+  (reviewer etc.) must be in the `khonliang` group.
+
+  Usage:
+  ```bash
+  # Stage the staged diff of the current working tree
+  HANDLE=$(kh-stage --diff)         # prints "fs:8f3a2e1c-..."
+  echo "$HANDLE"
+
+  # Pass to reviewer (once fr_reviewer_800e851d lands)
+  reviewer.review_diff staging_handle="$HANDLE"
+  ```
+
 ## Architecture boundary
 
 - **khonliang-bus-lib** — agent SDK. `BaseAgent` + `@handler` +

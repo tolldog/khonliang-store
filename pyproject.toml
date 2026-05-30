@@ -1,7 +1,7 @@
 [project]
 name = "khonliang-store"
-version = "0.6.0"
-description = "Bus-native store agent — artifact reads (Phase 2) + viewer (Phase 3) + local SQLite writes (Phase 4a) + composite local/bus reads & migration (Phase 4b); bus deprecation follows"
+version = "0.7.0"
+description = "Bus-native store agent — artifact reads (Phase 2) + viewer (Phase 3) + local SQLite writes (Phase 4a) + composite local/bus reads & migration (Phase 4b); also hosts user-side staging CLIs (kh-stage) for byte-shaped agent inputs"
 requires-python = ">=3.11"
 dependencies = [
     "khonliang-bus-lib>=0.5.0",  # >=0.5.0 for Welcome / WelcomeEntryPoint exports
@@ -14,6 +14,7 @@ test = ["pytest>=8.0", "pytest-asyncio>=0.24"]
 
 [project.scripts]
 khonliang-store = "store.agent:main"
+kh-stage = "store.cli.stage:main"
 
 [tool.setuptools.packages.find]
 include = ["store*"]
