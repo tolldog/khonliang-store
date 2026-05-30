@@ -8,6 +8,19 @@ FR with its own PR.
 
 ## Status
 
+Phase 5 (`fr_researcher_000ad07c`) shipped — researcher PR #34
+(2026-04-26). `stage_payload` and `ingest_from_artifact` are
+registered as bus skills on researcher-primary; the write side of
+the artifact lifecycle now crosses cleanly between store (owns the
+bytes) and researcher (consumes them as corpus).
+
+Phase 4c (bus repo) shipped — bus PR #24 (2026-04-26).
+`bus_artifact_*` read tools (`get`/`list`/`head`/`tail`/`metadata`/
+`grep`/`excerpt`) were removed from the bus MCP adapter; only
+`bus_artifact_distill[_many]` remain. The bus REST surface is
+marked deprecated and slated for removal once all operators have
+run `artifact_migrate_from_bus`.
+
 Phase 4b (`fr_store_ef668d56`): `CompositeArtifactBackend(local,
 bus)` — writes go to the local SQLite store; reads check local
 first and fall through to the bus REST surface for any artifact
@@ -34,13 +47,17 @@ pre-fetches artifacts via the same `ArtifactBackend` (in-process
 call, no bus round-trip), and returns a browser URL. Renderers
 are extensible via `@register_renderer("type/x")`.
 
-Phase 4b (composite read backend + bus → local migration) and
-Phase 4c (bus REST surface deprecation) remain open.
+The phase roadmap is complete. New work in this repo is filed as
+fresh FRs — most recently `fr_khonliang-bus-lib_520ce3bf` shipped
+`kh-stage`, a user-side CLI that captures byte payloads (`git diff
+--cached` today) and emits a routable handle for byte-shaped agent
+input handoff (2026-05-30).
 
 ## Stack
 
 - Python, async throughout
-- SQLite-backed store (planned — not yet in scope)
+- SQLite-backed local artifact store (`LocalArtifactStore`,
+  shipped in Phase 4a)
 - Native khonliang-bus agent via `khonliang-bus-lib`
 
 ## Ecosystem position
@@ -49,8 +66,8 @@ Phase 4c (bus REST surface deprecation) remain open.
 INFRASTRUCTURE (services)
 ├─ khonliang-scheduler  — LLM inference scheduling
 └─ khonliang-bus        — agent bus service, service registry,
-                          artifacts today (store agent takes over
-                          artifacts in a future phase), MCP adapter
+                          MCP adapter (artifact backend handed off
+                          to store agent in Phase 4)
 
 LIBRARIES (Python)
 ├─ khonliang            — agent primitives, stores, MCP transport
@@ -75,8 +92,8 @@ AGENTS/APPS
   agent-to-agent call.
 
 When in doubt: if it's about *storing, reading, rendering, or
-displaying an artifact*, it belongs here eventually. Today, nothing
-belongs here yet.
+displaying an artifact*, it belongs here. The artifact lifecycle
+(read, write, render, display) lives in this repo today.
 
 ## Phase roadmap
 
@@ -104,11 +121,16 @@ viewer skill.
    fallback; writes go local-only; `artifact_migrate_from_bus`
    skill copies bus-resident artifacts into local SQLite.
    `[artifacts] backend: composite` opts in.
-6. **Phase 4c** — deprecate bus's `bus_artifact_*` HTTP surface
-   once operators have run the migration. _Open._
-7. **Phase 5** — cross-reference from fr_researcher_000ad07c
-   (`stage_payload` / `ingest_from_artifact`) once store owns the
-   write path. _Open._
+6. **Phase 4c** ✅ shipped — bus PR #24 (2026-04-26). The bus's
+   `bus_artifact_*` read tools were removed from the MCP adapter
+   (only `bus_artifact_distill[_many]` remain); the bus REST
+   surface is marked deprecated and slated for removal once all
+   operators have run `artifact_migrate_from_bus`.
+7. **Phase 5** ✅ shipped — researcher PR #34 (2026-04-26).
+   `stage_payload` + `ingest_from_artifact` registered as bus
+   skills on researcher-primary (`fr_researcher_000ad07c`),
+   closing the write-side cross-reference between store (owns the
+   bytes) and researcher (consumes them as corpus).
 
 ## Running
 
