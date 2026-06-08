@@ -291,7 +291,6 @@ async def test_list_metadata_matches_non_string_scalars(backend):
 async def test_list_since_cutoff_filters_by_created_at(backend):
     """``since`` (epoch seconds) drops rows created before it and
     composes with metadata + kind."""
-    import sqlite3 as _sqlite3
     conn = backend._connect()
     # Two rows with explicit created_at straddling the cutoff.
     conn.execute(
@@ -314,6 +313,24 @@ async def test_list_since_cutoff_filters_by_created_at(backend):
     # Composes with metadata.
     hits2 = await backend.list(since=cutoff, metadata={"t": "x"})
     assert {a["id"] for a in hits2} == {"art_new"}
+
+
+@pytest.mark.asyncio
+async def test_list_metadata_key_is_matched_literally_not_as_path(backend):
+    """A dotted key matches a literal top-level member, not a
+    nested path — the quoted JSON path keeps the match flat for
+    direct backend callers that bypass the handler's key
+    validation."""
+    await backend.create(
+        kind="r", title="flat", content="x", metadata={"a.b": "hit"},
+    )
+    await backend.create(
+        kind="r", title="nested", content="x", metadata={"a": {"b": "miss"}},
+    )
+    # Matches the literal "a.b" member only — the nested {"a":{"b":...}}
+    # row must NOT be reinterpreted as a path traversal.
+    hits = await backend.list(metadata={"a.b": "hit"})
+    assert {a["title"] for a in hits} == {"flat"}
 
 
 @pytest.mark.asyncio

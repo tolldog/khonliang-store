@@ -422,6 +422,14 @@ def test_parse_timestamp_rejects_garbage_and_bool():
         parse_timestamp(True)
 
 
+def test_parse_timestamp_rejects_non_finite():
+    """nan / inf parse as floats but aren't meaningful cutoffs and
+    would overflow datetime.fromtimestamp in the local store."""
+    for bad in (float("nan"), float("inf"), float("-inf"), "nan", "inf", "1e400"):
+        with pytest.raises(ValueError):
+            parse_timestamp(bad)
+
+
 # -- artifact_metadata --------------------------------------------------------
 
 

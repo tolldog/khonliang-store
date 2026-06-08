@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any, Optional, Union
 from urllib.parse import quote
@@ -47,6 +48,21 @@ ListResult = Union[list[dict[str, Any]], dict[str, Any]]
 # ---------------------------------------------------------------------------
 
 
+def _finite_epoch(ts: float) -> float:
+    """Return ``ts`` if it's a finite epoch, else raise ``ValueError``.
+
+    ``float("nan")`` / ``float("inf")`` parse cleanly but aren't
+    meaningful cutoffs, and a non-finite value would later raise
+    ``OverflowError`` / ``ValueError`` deep inside the local store's
+    ``datetime.fromtimestamp`` (outside the ``sqlite3.Error``
+    envelope). Reject here so the skill handler surfaces a clean
+    structured error instead.
+    """
+    if not math.isfinite(ts):
+        raise ValueError("since must be a finite epoch or ISO-8601 timestamp")
+    return ts
+
+
 def parse_timestamp(value: Any) -> Optional[float]:
     """Coerce an epoch number or ISO-8601 string to epoch seconds (UTC).
 
@@ -54,7 +70,10 @@ def parse_timestamp(value: Any) -> Optional[float]:
     Accepts:
 
     * ``int`` / ``float`` — already epoch seconds (``bool`` is
-      rejected: ``True``/``False`` would silently become 1.0/0.0).
+      rejected: ``True``/``False`` would silently become 1.0/0.0;
+      ``nan`` / ``inf`` are rejected: a non-finite cutoff isn't a
+      meaningful timestamp and would later overflow
+      ``datetime.fromtimestamp`` in the local store).
     * a numeric string (``"1780870948"``) — parsed as epoch.
     * an ISO-8601 string (``"2026-06-07T10:30:00Z"`` or naive
       ``"2026-06-07"``). A trailing ``Z`` is honored; a naive
@@ -70,14 +89,16 @@ def parse_timestamp(value: Any) -> Optional[float]:
     if isinstance(value, bool):
         raise ValueError("since must be an epoch number or ISO-8601 timestamp")
     if isinstance(value, (int, float)):
-        return float(value)
+        return _finite_epoch(float(value))
     if isinstance(value, str):
         s = value.strip()
         if not s:
             return None
-        # A bare numeric string is epoch seconds.
+        # A bare numeric string is epoch seconds. ``float`` also
+        # parses ``"nan"`` / ``"inf"`` — ``_finite_epoch`` rejects
+        # those so a non-finite cutoff can't slip through.
         try:
-            return float(s)
+            return _finite_epoch(float(s))
         except ValueError:
             pass
         # Otherwise treat it as ISO-8601. ``fromisoformat`` doesn't

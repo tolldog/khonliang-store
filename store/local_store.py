@@ -320,14 +320,19 @@ class LocalArtifactStore(ArtifactBackend):
         if metadata:
             # Subset/AND match pushed into SQLite: one
             # ``json_extract`` equality per filter pair. The JSON
-            # path is itself a bound parameter (``$.<key>``) so a
-            # caller-supplied key can't break out of the path
-            # expression; the handler additionally validates keys
-            # to a safe charset before we get here. ``limit`` then
-            # applies over the *matched* set, not a pre-filter page.
+            # path is a bound parameter (never string-interpolated
+            # into SQL), and the key is double-quoted *within* that
+            # path (``$."<key>"``) so it's always read as a single
+            # literal object member — a key containing ``.``/``[]``
+            # can't be reinterpreted as a nested-path traversal.
+            # This keeps the local match flat and consistent with
+            # the bus-side ``metadata_matches`` (literal-key) even
+            # for direct backend callers that bypass the handler's
+            # key-charset validation. ``limit`` then applies over
+            # the *matched* set, not a pre-filter page.
             for key, value in metadata.items():
                 clauses.append("json_extract(metadata, ?) = ?")
-                params.append(f"$.{key}")
+                params.append(_json_member_path(key))
                 params.append(value)
         if since is not None:
             # ``created_at`` is stored as a zero-padded ISO-8601 UTC
@@ -591,6 +596,18 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
                 # forensics.
                 out[json_field] = {} if json_field == "metadata" else []
     return out
+
+
+def _json_member_path(key: str) -> str:
+    """Build a SQLite JSON path that reads ``key`` as one literal member.
+
+    Double-quoting the key (``$."<key>"``) forces SQLite's JSON
+    path parser to treat ``.``/``[``/``]`` as ordinary characters
+    of the member name rather than path syntax, so the match stays
+    flat regardless of the key's contents. Embedded double quotes
+    are escaped by doubling, per the JSON-path quoting rules.
+    """
+    return '$."' + key.replace('"', '""') + '"'
 
 
 def _epoch_to_iso(ts: float) -> str:
