@@ -49,17 +49,30 @@ ListResult = Union[list[dict[str, Any]], dict[str, Any]]
 
 
 def _finite_epoch(ts: float) -> float:
-    """Return ``ts`` if it's a finite epoch, else raise ``ValueError``.
+    """Return ``ts`` if it's a usable epoch, else raise ``ValueError``.
 
-    ``float("nan")`` / ``float("inf")`` parse cleanly but aren't
-    meaningful cutoffs, and a non-finite value would later raise
-    ``OverflowError`` / ``ValueError`` deep inside the local store's
-    ``datetime.fromtimestamp`` (outside the ``sqlite3.Error``
-    envelope). Reject here so the skill handler surfaces a clean
-    structured error instead.
+    Rejects two ways a float can be a valid number yet a useless
+    cutoff, both of which would otherwise raise deep inside the
+    local store's ``datetime.fromtimestamp`` (in ``_epoch_to_iso``,
+    *outside* the ``sqlite3.Error`` envelope) and crash the skill
+    call instead of yielding a structured error:
+
+    * non-finite — ``float("nan")`` / ``float("inf")`` parse cleanly
+      but aren't meaningful timestamps;
+    * out of range — a finite but absurd magnitude (``1e20``) is past
+      what ``datetime`` can represent and raises
+      ``OverflowError`` / ``OSError``.
+
+    The representability probe uses the same ``fromtimestamp`` call
+    the local store will make, so anything that survives here is
+    safe to format downstream.
     """
     if not math.isfinite(ts):
         raise ValueError("since must be a finite epoch or ISO-8601 timestamp")
+    try:
+        datetime.fromtimestamp(ts, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError("since is out of the representable timestamp range") from exc
     return ts
 
 
@@ -123,9 +136,12 @@ def metadata_matches(item_metadata: Any, metadata_filter: dict[str, Any]) -> boo
     Returns ``True`` iff ``item_metadata`` is a dict that contains
     every ``key=value`` pair in ``metadata_filter`` (scalar
     equality on each). A key that's absent, or present with a
-    differing value, fails the whole match. Mirrors the SQL
-    ``json_extract(metadata, '$.<key>') = ?`` clauses the local
-    store applies in-engine.
+    differing value, fails the whole match. The plain ``dict``
+    lookup here treats the key literally; that matches the local
+    store's in-engine predicate, which quotes the key into the JSON
+    path (``json_extract(metadata, '$."<key>"') = ?``) precisely so
+    a dotted/bracketed key stays a literal member rather than a
+    nested-path traversal.
     """
     if not isinstance(item_metadata, dict):
         return False

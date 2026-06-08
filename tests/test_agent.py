@@ -430,6 +430,15 @@ def test_parse_timestamp_rejects_non_finite():
             parse_timestamp(bad)
 
 
+def test_parse_timestamp_rejects_out_of_range_epoch():
+    """Finite but unrepresentable epochs (1e20) must be rejected
+    here, not deferred to a datetime.fromtimestamp overflow inside
+    the local store (which is outside the sqlite3.Error envelope)."""
+    for bad in (1e20, -1e20, "1e20"):
+        with pytest.raises(ValueError):
+            parse_timestamp(bad)
+
+
 # -- artifact_metadata --------------------------------------------------------
 
 
