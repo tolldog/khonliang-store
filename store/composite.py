@@ -224,6 +224,8 @@ class CompositeArtifactBackend(ArtifactBackend):
         kind: str = "",
         producer: str = "",
         limit: int = 20,
+        metadata: Optional[dict[str, Any]] = None,
+        since: Optional[float] = None,
     ) -> ListResult:
         """Union of local + fallback rows, deduplicated by id.
 
@@ -258,6 +260,7 @@ class CompositeArtifactBackend(ArtifactBackend):
             return []
         local = await self._local.list(
             session_id=session_id, kind=kind, producer=producer, limit=limit,
+            metadata=metadata, since=since,
         )
         if isinstance(local, dict):
             return local
@@ -278,6 +281,7 @@ class CompositeArtifactBackend(ArtifactBackend):
         fallback_limit = min(MAX_LIST_LIMIT, limit + len(local))
         fallback = await self._fallback.list(
             session_id=session_id, kind=kind, producer=producer, limit=fallback_limit,
+            metadata=metadata, since=since,
         )
         if isinstance(fallback, dict):
             # Fallback errored; surface what we got from local

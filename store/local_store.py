@@ -27,6 +27,7 @@ import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 
@@ -282,16 +283,20 @@ class LocalArtifactStore(ArtifactBackend):
         kind: str = "",
         producer: str = "",
         limit: int = 20,
+        metadata: Optional[dict[str, Any]] = None,
+        since: Optional[float] = None,
     ) -> ListResult:
         try:
             return await asyncio.to_thread(
-                self._sync_list, session_id, kind, producer, limit
+                self._sync_list, session_id, kind, producer, limit, metadata, since
             )
         except sqlite3.Error as exc:
             return self._store_error_envelope("list", exc)
 
     def _sync_list(
         self, session_id: str, kind: str, producer: str, limit: int,
+        metadata: Optional[dict[str, Any]] = None,
+        since: Optional[float] = None,
     ) -> list[dict[str, Any]]:
         # Clamp to ``[0, MAX_LIST_LIMIT]`` rather than
         # ``[1, MAX_LIST_LIMIT]``: a caller asking for ``limit=0``
@@ -312,6 +317,25 @@ class LocalArtifactStore(ArtifactBackend):
         if producer:
             clauses.append("producer = ?")
             params.append(producer)
+        if metadata:
+            # Subset/AND match pushed into SQLite: one
+            # ``json_extract`` equality per filter pair. The JSON
+            # path is itself a bound parameter (``$.<key>``) so a
+            # caller-supplied key can't break out of the path
+            # expression; the handler additionally validates keys
+            # to a safe charset before we get here. ``limit`` then
+            # applies over the *matched* set, not a pre-filter page.
+            for key, value in metadata.items():
+                clauses.append("json_extract(metadata, ?) = ?")
+                params.append(f"$.{key}")
+                params.append(value)
+        if since is not None:
+            # ``created_at`` is stored as a zero-padded ISO-8601 UTC
+            # string (``strftime('%Y-%m-%dT%H:%M:%fZ', 'now')``), so a
+            # lexical ``>=`` against an identically-formatted cutoff
+            # is a correct chronological comparison.
+            clauses.append("created_at >= ?")
+            params.append(_epoch_to_iso(since))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._lock:
             conn = self._connect()
@@ -567,6 +591,19 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
                 # forensics.
                 out[json_field] = {} if json_field == "metadata" else []
     return out
+
+
+def _epoch_to_iso(ts: float) -> str:
+    """Format epoch seconds as the store's canonical ISO-8601 string.
+
+    Matches the millisecond-precision UTC shape that SQLite's
+    ``strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`` writes into
+    ``created_at``, so the resulting string orders lexically the
+    same way the stored values do and ``created_at >= ?`` is a
+    correct chronological cutoff.
+    """
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
 def _clamp_max_chars(max_chars: int) -> int:

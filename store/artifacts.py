@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import abc
 import logging
+from datetime import datetime, timezone
 from typing import Any, Optional, Union
 from urllib.parse import quote
 
@@ -35,6 +36,130 @@ logger = logging.getLogger(__name__)
 # an ``error`` key is the unambiguous failure shape and lets
 # callers distinguish "outage" from "zero artifacts".
 ListResult = Union[list[dict[str, Any]], dict[str, Any]]
+
+
+# ---------------------------------------------------------------------------
+# Timeframe parsing — shared across the whole store so the ``since``
+# cutoff has one definition (the skill handler normalizes the raw
+# arg through it, the bus-backed client-side filter reuses it to
+# parse each row's ``created_at``, and a future consumer's
+# reading-list timeframe maps onto the same canonical epoch).
+# ---------------------------------------------------------------------------
+
+
+def parse_timestamp(value: Any) -> Optional[float]:
+    """Coerce an epoch number or ISO-8601 string to epoch seconds (UTC).
+
+    Returns ``None`` for ``None`` / empty input (no cutoff).
+    Accepts:
+
+    * ``int`` / ``float`` — already epoch seconds (``bool`` is
+      rejected: ``True``/``False`` would silently become 1.0/0.0).
+    * a numeric string (``"1780870948"``) — parsed as epoch.
+    * an ISO-8601 string (``"2026-06-07T10:30:00Z"`` or naive
+      ``"2026-06-07"``). A trailing ``Z`` is honored; a naive
+      timestamp is assumed UTC to match how the local store stamps
+      ``created_at`` (SQLite ``'now'`` is UTC).
+
+    Raises ``ValueError`` on any other shape so the skill handler
+    can surface a structured error rather than silently dropping
+    the filter.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError("since must be an epoch number or ISO-8601 timestamp")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        # A bare numeric string is epoch seconds.
+        try:
+            return float(s)
+        except ValueError:
+            pass
+        # Otherwise treat it as ISO-8601. ``fromisoformat`` doesn't
+        # accept the ``Z`` zone designator before 3.11, so swap it
+        # for the explicit ``+00:00`` offset.
+        iso = s[:-1] + "+00:00" if s.endswith("Z") else s
+        try:
+            dt = datetime.fromisoformat(iso)
+        except ValueError as exc:
+            raise ValueError(
+                "since must be an epoch number or ISO-8601 timestamp"
+            ) from exc
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    raise ValueError("since must be an epoch number or ISO-8601 timestamp")
+
+
+def metadata_matches(item_metadata: Any, metadata_filter: dict[str, Any]) -> bool:
+    """Subset/AND match used by client-side (bus) filtering.
+
+    Returns ``True`` iff ``item_metadata`` is a dict that contains
+    every ``key=value`` pair in ``metadata_filter`` (scalar
+    equality on each). A key that's absent, or present with a
+    differing value, fails the whole match. Mirrors the SQL
+    ``json_extract(metadata, '$.<key>') = ?`` clauses the local
+    store applies in-engine.
+    """
+    if not isinstance(item_metadata, dict):
+        return False
+    for key, value in metadata_filter.items():
+        if key not in item_metadata:
+            return False
+        if item_metadata[key] != value:
+            return False
+    return True
+
+
+def _created_after(created_at: Any, since_epoch: float) -> bool:
+    """``True`` iff ``created_at`` parses and is >= ``since_epoch``.
+
+    Tolerant: a missing / unparseable ``created_at`` excludes the
+    row rather than raising, so one malformed timestamp can't fail
+    a whole list response.
+    """
+    if not created_at:
+        return False
+    try:
+        ts = parse_timestamp(created_at)
+    except ValueError:
+        return False
+    return ts is not None and ts >= since_epoch
+
+
+def apply_client_filters(
+    items: list[dict[str, Any]],
+    metadata_filter: Optional[dict[str, Any]],
+    since: Optional[float],
+) -> list[dict[str, Any]]:
+    """Filter a fetched page of artifact rows by metadata / since.
+
+    Used by read-only backends (the deprecated bus REST surface)
+    that can't push the predicate down to the data source. Note:
+    this narrows the *already-paged* result, so a match beyond the
+    fetched page is invisible — the scalable path is the local
+    store's in-SQL filter. Acceptable for the bus fallback, which
+    is slated for removal once all operators have migrated.
+    """
+    if not metadata_filter and since is None:
+        return items
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if metadata_filter and not metadata_matches(
+            item.get("metadata"), metadata_filter
+        ):
+            continue
+        if since is not None and not _created_after(item.get("created_at"), since):
+            continue
+        out.append(item)
+    return out
 
 
 def _encode_id(artifact_id: str) -> str:
@@ -65,7 +190,21 @@ class ArtifactBackend(abc.ABC):
         kind: str = "",
         producer: str = "",
         limit: int = 20,
-    ) -> ListResult: ...
+        metadata: Optional[dict[str, Any]] = None,
+        since: Optional[float] = None,
+    ) -> ListResult:
+        """List artifact metadata, newest first.
+
+        ``metadata`` is an optional subset/AND filter: only
+        artifacts whose stored metadata contains every given
+        ``key=value`` pair (scalar equality) are returned. ``since``
+        is an optional ``created_at`` cutoff in epoch seconds
+        (inclusive). Both compose (AND) with ``session_id`` / ``kind``
+        / ``producer`` and with ``limit``, which bounds the *filtered*
+        set. Absent ``metadata`` / ``since`` reproduces the
+        pre-filter behavior exactly.
+        """
+        ...
 
     @abc.abstractmethod
     async def metadata(self, artifact_id: str) -> dict[str, Any]: ...
@@ -197,6 +336,8 @@ class BusBackedArtifactStore(ArtifactBackend):
         kind: str = "",
         producer: str = "",
         limit: int = 20,
+        metadata: Optional[dict[str, Any]] = None,
+        since: Optional[float] = None,
     ) -> ListResult:
         params = {
             "session_id": session_id,
@@ -211,7 +352,11 @@ class BusBackedArtifactStore(ArtifactBackend):
             "/v1/artifacts", params=params, is_id_route=False
         )
         if isinstance(result, list):
-            return result
+            # The bus REST surface doesn't push down metadata /
+            # since predicates, so apply them client-side over the
+            # fetched page. This is the deprecated read path; the
+            # scalable in-SQL filter lives on LocalArtifactStore.
+            return apply_client_filters(result, metadata, since)
         # Preserve error envelopes (network failure / 4xx / 5xx /
         # non-JSON) so a transport blip is distinguishable from a
         # genuine "zero artifacts match these filters" result.

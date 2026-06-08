@@ -87,6 +87,42 @@ async def test_list_passes_filters_and_strips_trailing_slash(http_log, make_hand
 
 
 @pytest.mark.asyncio
+async def test_list_applies_metadata_filter_client_side(http_log, make_handler):
+    """The bus REST surface can't push down the predicate, so the
+    backend filters the fetched page by metadata client-side."""
+    page = [
+        {"id": "art_a", "metadata": {"fr_id": "fr_x"}},
+        {"id": "art_b", "metadata": {"fr_id": "fr_y"}},
+        {"id": "art_c", "metadata": {}},
+    ]
+    backend, client = _make_backend(make_handler(page))
+    try:
+        result = await backend.list(metadata={"fr_id": "fr_x"})
+    finally:
+        await client.aclose()
+    assert [r["id"] for r in result] == ["art_a"]
+    # metadata/since are NOT sent to the bus (it'd ignore them) —
+    # only the columns the REST endpoint understands.
+    assert set(http_log[0]["params"]) == {
+        "session_id", "kind", "producer", "limit",
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_applies_since_filter_client_side(make_handler):
+    page = [
+        {"id": "art_old", "created_at": "2026-01-01T00:00:00Z"},
+        {"id": "art_new", "created_at": "2026-06-01T00:00:00Z"},
+    ]
+    backend, client = _make_backend(make_handler(page))
+    try:
+        result = await backend.list(since=1772323200.0)  # 2026-03-01
+    finally:
+        await client.aclose()
+    assert [r["id"] for r in result] == ["art_new"]
+
+
+@pytest.mark.asyncio
 async def test_list_preserves_error_envelope_from_outage(make_handler):
     """A 5xx-via-_get_json must surface as an error envelope, not
     an empty list — empty-list would be indistinguishable from

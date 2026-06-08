@@ -209,6 +209,122 @@ async def test_list_filters_by_kind_session_producer(backend):
 
 
 @pytest.mark.asyncio
+async def test_list_metadata_subset_match(backend):
+    """``metadata={k: v}`` returns only artifacts whose stored
+    metadata contains that pair (the reviewer's
+    ``list_reviews(fr_id=...)`` shape)."""
+    await backend.create(
+        kind="reviewer_artifact_review", title="A", content="x",
+        metadata={"review_kind": "diff", "fr_id": "fr_x", "project": "khonliang"},
+    )
+    await backend.create(
+        kind="reviewer_artifact_review", title="B", content="x",
+        metadata={"review_kind": "diff", "fr_id": "fr_y", "project": "khonliang"},
+    )
+    hits = await backend.list(metadata={"fr_id": "fr_x"})
+    assert {a["title"] for a in hits} == {"A"}
+    # The surviving row still carries its full metadata dict.
+    assert hits[0]["metadata"]["project"] == "khonliang"
+
+
+@pytest.mark.asyncio
+async def test_list_metadata_multi_key_ands(backend):
+    """Multiple metadata pairs AND together."""
+    await backend.create(
+        kind="r", title="A", content="x",
+        metadata={"fr_id": "fr_x", "review_kind": "diff"},
+    )
+    await backend.create(
+        kind="r", title="B", content="x",
+        metadata={"fr_id": "fr_x", "review_kind": "spec"},
+    )
+    hits = await backend.list(metadata={"fr_id": "fr_x", "review_kind": "spec"})
+    assert {a["title"] for a in hits} == {"B"}
+
+
+@pytest.mark.asyncio
+async def test_list_metadata_absent_key_excludes(backend):
+    """A filter key absent from a row's metadata excludes it (no
+    match on a missing key, not a match-on-null)."""
+    await backend.create(
+        kind="r", title="A", content="x", metadata={"review_kind": "diff"},
+    )
+    hits = await backend.list(metadata={"fr_id": "fr_x"})
+    assert hits == []
+
+
+@pytest.mark.asyncio
+async def test_list_metadata_composes_with_kind(backend):
+    """metadata filter ANDs with the existing kind filter."""
+    await backend.create(
+        kind="reviewer_artifact_review", title="A", content="x",
+        metadata={"fr_id": "fr_x"},
+    )
+    await backend.create(
+        kind="note", title="B", content="x", metadata={"fr_id": "fr_x"},
+    )
+    hits = await backend.list(
+        kind="reviewer_artifact_review", metadata={"fr_id": "fr_x"},
+    )
+    assert {a["title"] for a in hits} == {"A"}
+
+
+@pytest.mark.asyncio
+async def test_list_metadata_matches_non_string_scalars(backend):
+    """Numeric / boolean metadata values match through
+    json_extract's scalar typing."""
+    await backend.create(
+        kind="r", title="A", content="x",
+        metadata={"round": 2, "final": True},
+    )
+    await backend.create(
+        kind="r", title="B", content="x",
+        metadata={"round": 3, "final": False},
+    )
+    by_num = await backend.list(metadata={"round": 2})
+    assert {a["title"] for a in by_num} == {"A"}
+    by_bool = await backend.list(metadata={"final": True})
+    assert {a["title"] for a in by_bool} == {"A"}
+
+
+@pytest.mark.asyncio
+async def test_list_since_cutoff_filters_by_created_at(backend):
+    """``since`` (epoch seconds) drops rows created before it and
+    composes with metadata + kind."""
+    import sqlite3 as _sqlite3
+    conn = backend._connect()
+    # Two rows with explicit created_at straddling the cutoff.
+    conn.execute(
+        "INSERT INTO artifacts (id, kind, title, size_bytes, sha256, "
+        "content, metadata, created_at) VALUES "
+        "('art_old', 'r', 'old', 0, '', '', '{\"t\":\"x\"}', "
+        "'2026-01-01T00:00:00.000Z')",
+    )
+    conn.execute(
+        "INSERT INTO artifacts (id, kind, title, size_bytes, sha256, "
+        "content, metadata, created_at) VALUES "
+        "('art_new', 'r', 'new', 0, '', '', '{\"t\":\"x\"}', "
+        "'2026-06-01T00:00:00.000Z')",
+    )
+    conn.commit()
+    # 2026-03-01 epoch cutoff: only the June row survives.
+    cutoff = 1772323200.0  # 2026-03-01T00:00:00Z
+    hits = await backend.list(since=cutoff)
+    assert {a["id"] for a in hits} == {"art_new"}
+    # Composes with metadata.
+    hits2 = await backend.list(since=cutoff, metadata={"t": "x"})
+    assert {a["id"] for a in hits2} == {"art_new"}
+
+
+@pytest.mark.asyncio
+async def test_list_no_metadata_is_backcompat(backend):
+    """Absent metadata/since reproduces the unfiltered result."""
+    await backend.create(kind="note", title="A", content="x")
+    await backend.create(kind="note", title="B", content="x")
+    assert len(await backend.list()) == 2
+
+
+@pytest.mark.asyncio
 async def test_list_clamps_limit_to_hard_max(backend):
     """Caller-supplied limit > MAX_LIST_LIMIT must clamp rather
     than honor — protects the agent from a runaway request that
