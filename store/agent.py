@@ -292,26 +292,40 @@ class StoreAgent(BaseAgent):
                     "session_id": {"type": "string", "default": ""},
                     "kind": {"type": "string", "default": ""},
                     "producer": {"type": "string", "default": ""},
+                    # ``metadata`` and ``since`` intentionally omit a
+                    # ``type``: the handler coerces more than one input
+                    # shape for each (an object *or* a JSON-encoded
+                    # object string; an epoch number *or* a numeric/ISO
+                    # string), and the bus schema validator's vocabulary
+                    # is single-type — it can't express the union, and a
+                    # list-type (``["object","string"]``) would crash the
+                    # client-side ``request_typed`` strict validator on an
+                    # unhashable-key membership test. Omitting ``type``
+                    # makes the validator skip the field (handler does the
+                    # real coercion / validation) while the description
+                    # carries the accepted shapes for LLM / MCP consumers.
                     "metadata": {
-                        "type": "object",
                         "default": {},
                         "description": (
                             "Subset/AND filter: returns only artifacts "
                             "whose stored metadata contains ALL these "
-                            "key=value pairs (scalar equality). Keys are "
-                            "flat identifiers ([A-Za-z0-9_-]+); values are "
-                            "scalars. A missing or differing key excludes "
-                            "the artifact. Filtered in SQL, so limit "
-                            "applies over the matched set."
+                            "key=value pairs (scalar equality). Accepts an "
+                            "object or a JSON-encoded object string. Keys "
+                            "are flat identifiers ([A-Za-z0-9_-]+); values "
+                            "are scalars (string/number/bool — booleans "
+                            "stay distinct from 0/1). A missing or differing "
+                            "key excludes the artifact. Filtered in SQL, so "
+                            "limit applies over the matched set."
                         ),
                     },
                     "since": {
-                        "type": "string",
                         "default": "",
                         "description": (
                             "created_at cutoff (inclusive). Epoch seconds "
-                            "or an ISO-8601 UTC timestamp; returns only "
-                            "artifacts created at or after this time."
+                            "(as a number or numeric string) or an ISO-8601 "
+                            "timestamp (UTC; naive is assumed UTC, a "
+                            "trailing Z is honored); returns only artifacts "
+                            "created at or after this time."
                         ),
                     },
                     "limit": {"type": "integer", "default": 20},

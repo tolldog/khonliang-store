@@ -413,6 +413,12 @@ def test_parse_timestamp_forms():
     assert parse_timestamp("2026-03-01T00:00:00Z") == pytest.approx(1772323200.0)
     # Naive ISO is assumed UTC (matches how created_at is stamped).
     assert parse_timestamp("2026-03-01") == pytest.approx(1772323200.0)
+    # ISO-8601 *basic* format (no separators) must parse as a date,
+    # not be misread as the epoch 20260301.0 (≈1970) by float().
+    assert parse_timestamp("20260301") == pytest.approx(1772323200.0)
+    # A real 10-digit epoch string is not valid ISO, so it still
+    # falls through to the numeric branch unchanged.
+    assert parse_timestamp("1772323200") == 1772323200.0
 
 
 def test_parse_timestamp_rejects_garbage_and_bool():

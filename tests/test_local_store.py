@@ -288,6 +288,40 @@ async def test_list_metadata_matches_non_string_scalars(backend):
 
 
 @pytest.mark.asyncio
+async def test_list_metadata_bool_not_conflated_with_int(backend):
+    """``json_extract`` coerces JSON ``true``/``false`` to ``1``/``0``;
+    the filter must keep booleans distinct from numeric 0/1 so
+    scalar equality stays honest both ways."""
+    await backend.create(
+        kind="r", title="BoolTrue", content="x", metadata={"flag": True},
+    )
+    await backend.create(
+        kind="r", title="IntOne", content="x", metadata={"flag": 1},
+    )
+    await backend.create(
+        kind="r", title="BoolFalse", content="x", metadata={"flag": False},
+    )
+    await backend.create(
+        kind="r", title="IntZero", content="x", metadata={"flag": 0},
+    )
+    # bool True matches only the bool row, not int 1.
+    assert {a["title"] for a in await backend.list(metadata={"flag": True})} == {
+        "BoolTrue"
+    }
+    # int 1 matches only the int row, not bool True.
+    assert {a["title"] for a in await backend.list(metadata={"flag": 1})} == {
+        "IntOne"
+    }
+    # bool False vs int 0 symmetric.
+    assert {a["title"] for a in await backend.list(metadata={"flag": False})} == {
+        "BoolFalse"
+    }
+    assert {a["title"] for a in await backend.list(metadata={"flag": 0})} == {
+        "IntZero"
+    }
+
+
+@pytest.mark.asyncio
 async def test_list_since_cutoff_filters_by_created_at(backend):
     """``since`` (epoch seconds) drops rows created before it and
     composes with metadata + kind."""
@@ -316,6 +350,26 @@ async def test_list_since_cutoff_filters_by_created_at(backend):
 
 
 @pytest.mark.asyncio
+async def test_list_since_submillisecond_cutoff_ceils(backend):
+    """A sub-ms ``since`` must not admit ms-precision rows that are
+    fractionally older. With a cutoff of …00.1239Z, the row stamped
+    …00.123Z predates it and is excluded; …00.124Z is included."""
+    conn = backend._connect()
+    for ms in ("123", "124"):
+        conn.execute(
+            "INSERT INTO artifacts (id, kind, title, size_bytes, sha256, "
+            "content, metadata, created_at) VALUES "
+            f"('art_{ms}', 'r', '{ms}', 0, '', '', '{{}}', "
+            f"'2026-03-01T00:00:00.{ms}Z')",
+        )
+    conn.commit()
+    # cutoff = 2026-03-01T00:00:00.1239Z (sub-ms). Ceiling → .124Z.
+    cutoff = 1772323200.1239
+    hits = await backend.list(since=cutoff)
+    assert {a["id"] for a in hits} == {"art_124"}
+
+
+@pytest.mark.asyncio
 async def test_list_metadata_key_is_matched_literally_not_as_path(backend):
     """A dotted key matches a literal top-level member, not a
     nested path — the quoted JSON path keeps the match flat for
@@ -331,6 +385,31 @@ async def test_list_metadata_key_is_matched_literally_not_as_path(backend):
     # row must NOT be reinterpreted as a path traversal.
     hits = await backend.list(metadata={"a.b": "hit"})
     assert {a["title"] for a in hits} == {"flat"}
+
+
+@pytest.mark.asyncio
+async def test_list_metadata_double_quote_key_returns_error(backend):
+    """A metadata key containing a double quote can't be expressed
+    as a SQLite JSON path (``""`` is not an escape there), so a
+    direct backend caller bypassing the handler gets a clean error
+    envelope rather than a silently-never-matching query."""
+    await backend.create(
+        kind="r", title="A", content="x", metadata={'a"b': "v"},
+    )
+    result = await backend.list(metadata={'a"b': "v"})
+    assert isinstance(result, dict)
+    assert "double quote" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_list_out_of_range_since_returns_error(backend):
+    """A direct backend caller bypassing ``parse_timestamp`` can pass
+    an out-of-range epoch; ``_epoch_to_iso`` must surface it as a
+    structured error envelope, not a raw OverflowError/OSError that
+    crashes the read path outside the sqlite3.Error guard."""
+    result = await backend.list(since=1e20)
+    assert isinstance(result, dict)
+    assert "range" in result["error"]
 
 
 @pytest.mark.asyncio
