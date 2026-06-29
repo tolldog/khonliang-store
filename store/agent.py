@@ -42,13 +42,14 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from typing import Any, Optional, Tuple
 
 import yaml
 from khonliang_bus import BaseAgent, Skill, Welcome, WelcomeEntryPoint, handler
 
-from store.artifacts import ArtifactBackend, BusBackedArtifactStore
+from store.artifacts import ArtifactBackend, BusBackedArtifactStore, parse_timestamp
 from store.composite import CompositeArtifactBackend
 from store.local_store import HARD_MAX_CHARS, LocalArtifactStore, MAX_LIST_LIMIT
 from store.viewer import ArtifactRef, PreparedTab, display as viewer_display
@@ -220,7 +221,7 @@ class StoreAgent(BaseAgent):
             ),
             WelcomeEntryPoint(
                 skill="artifact_list",
-                when_to_use="browse with filters (kind, producer, session_id); newest-first ordering",
+                when_to_use="browse with filters (kind, producer, session_id, metadata subset-match, since cutoff); newest-first ordering",
             ),
             WelcomeEntryPoint(
                 skill="display",
@@ -284,11 +285,49 @@ class StoreAgent(BaseAgent):
             Skill(
                 "artifact_list",
                 "List artifact metadata. Filters: session_id, kind, "
-                "producer; capped by limit. Does not return content.",
+                "producer, metadata (subset/AND match), since "
+                "(created_at cutoff); capped by limit over the "
+                "filtered set. Does not return content.",
                 {
                     "session_id": {"type": "string", "default": ""},
                     "kind": {"type": "string", "default": ""},
                     "producer": {"type": "string", "default": ""},
+                    # ``metadata`` and ``since`` intentionally omit a
+                    # ``type``: the handler coerces more than one input
+                    # shape for each (an object *or* a JSON-encoded
+                    # object string; an epoch number *or* a numeric/ISO
+                    # string), and the bus schema validator's vocabulary
+                    # is single-type — it can't express the union, and a
+                    # list-type (``["object","string"]``) would crash the
+                    # client-side ``request_typed`` strict validator on an
+                    # unhashable-key membership test. Omitting ``type``
+                    # makes the validator skip the field (handler does the
+                    # real coercion / validation) while the description
+                    # carries the accepted shapes for LLM / MCP consumers.
+                    "metadata": {
+                        "default": {},
+                        "description": (
+                            "Subset/AND filter: returns only artifacts "
+                            "whose stored metadata contains ALL these "
+                            "key=value pairs (scalar equality). Accepts an "
+                            "object or a JSON-encoded object string. Keys "
+                            "are flat identifiers ([A-Za-z0-9_-]+); values "
+                            "are scalars (string/number/bool — booleans "
+                            "stay distinct from 0/1). A missing or differing "
+                            "key excludes the artifact. Filtered in SQL, so "
+                            "limit applies over the matched set."
+                        ),
+                    },
+                    "since": {
+                        "default": "",
+                        "description": (
+                            "created_at cutoff (inclusive). Epoch seconds "
+                            "(as a number or numeric string) or an ISO-8601 "
+                            "timestamp (UTC; naive is assumed UTC, a "
+                            "trailing Z is honored); returns only artifacts "
+                            "created at or after this time."
+                        ),
+                    },
                     "limit": {"type": "integer", "default": 20},
                 },
                 since="0.4.0",
@@ -472,6 +511,8 @@ class StoreAgent(BaseAgent):
     async def handle_artifact_list(self, args: dict[str, Any]) -> dict[str, Any]:
         try:
             limit = _int_arg(args, "limit", 20)
+            metadata_filter = _parse_metadata_filter(args.get("metadata"))
+            since = parse_timestamp(args.get("since"))
         except ValueError as exc:
             return {"error": str(exc)}
         items = await self._backend.list(
@@ -479,6 +520,8 @@ class StoreAgent(BaseAgent):
             kind=str(args.get("kind") or ""),
             producer=str(args.get("producer") or ""),
             limit=limit,
+            metadata=metadata_filter,
+            since=since,
         )
         # Pass error envelopes through verbatim — wrapping them as
         # {"artifacts": {"error": ...}} would let a callsite that
@@ -1158,6 +1201,61 @@ def _required_int(args: dict[str, Any], name: str) -> int:
     if value is None or value == "":
         raise ValueError(f"{name} is required")
     return _coerce_int(name, value)
+
+
+# Metadata-filter keys map onto a SQLite JSON path (``$.<key>``).
+# Restricting to a flat identifier charset keeps the match flat —
+# a key containing ``.``/``[``/``]`` would otherwise be read as a
+# nested-path traversal, which is explicitly out of scope for this
+# first cut (flat key=value AND only).
+_META_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _parse_metadata_filter(raw: Any) -> Optional[dict[str, Any]]:
+    """Validate the ``metadata`` arg into a flat scalar filter dict.
+
+    Accepts a dict (structured bus arg) or a JSON-encoded object
+    string. Returns ``None`` for absent / empty input (no filter).
+    Enforces the first-cut contract:
+
+    * keys are flat identifiers (``[A-Za-z0-9_-]+``);
+    * values are scalars (``str`` / ``int`` / ``float`` / ``bool``).
+
+    Anything else — a non-object, a nested/array/``null`` value, a
+    path-shaped key — raises ``ValueError`` so the handler emits a
+    structured error envelope instead of silently dropping or
+    mis-applying the filter.
+    """
+    if raw is None or raw == "":
+        return None
+    value: Any = raw
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("metadata filter must be a JSON object") from exc
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"metadata filter must be a JSON object, got {type(value).__name__}"
+        )
+    if not value:
+        return None
+    for key, val in value.items():
+        if not isinstance(key, str) or not _META_KEY_RE.match(key):
+            raise ValueError(
+                "metadata filter keys must be non-empty and match "
+                "[A-Za-z0-9_-]+ (flat key=value match only)"
+            )
+        # ``bool`` first: it's an ``int`` subclass, so the
+        # isinstance check below would accept it anyway, but calling
+        # it out keeps the accepted-scalar set explicit.
+        if isinstance(val, bool):
+            continue
+        if not isinstance(val, (str, int, float)):
+            raise ValueError(
+                "metadata filter values must be scalars (str, number, bool)"
+            )
+    return value
 
 
 def _parse_artifact_refs(raw: Any) -> list[ArtifactRef]:

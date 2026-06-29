@@ -27,21 +27,23 @@ import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 
 logger = logging.getLogger(__name__)
 
-from store.artifacts import ArtifactBackend, ListResult
+from store.artifacts import MAX_LIST_LIMIT, ArtifactBackend, ListResult
 
 
 # Match the bus's caps so artifacts written via the local skill
 # can be migrated to / from the bus side without surprise size
-# rejections at the boundary.
+# rejections at the boundary. ``MAX_LIST_LIMIT`` is defined in
+# ``store.artifacts`` (its conceptual home is the bus REST clamp)
+# and re-exported here so existing importers keep working.
 DEFAULT_MAX_CHARS = 4000
 HARD_MAX_CHARS = 20_000
 MAX_ARTIFACT_BYTES = 10 * 1024 * 1024  # 10 MiB
-MAX_LIST_LIMIT = 100
 MAX_GREP_MATCHES = 100
 MAX_GREP_CONTEXT_LINES = 50
 MAX_HEAD_TAIL_LINES = 1000
@@ -282,16 +284,25 @@ class LocalArtifactStore(ArtifactBackend):
         kind: str = "",
         producer: str = "",
         limit: int = 20,
+        metadata: Optional[dict[str, Any]] = None,
+        since: Optional[float] = None,
     ) -> ListResult:
         try:
             return await asyncio.to_thread(
-                self._sync_list, session_id, kind, producer, limit
+                self._sync_list, session_id, kind, producer, limit, metadata, since
             )
         except sqlite3.Error as exc:
             return self._store_error_envelope("list", exc)
+        except ValueError as exc:
+            # An un-representable metadata key (e.g. one containing a
+            # double quote) surfaces as a clean error envelope rather
+            # than crashing the skill outside the sqlite3.Error guard.
+            return {"error": str(exc)}
 
     def _sync_list(
         self, session_id: str, kind: str, producer: str, limit: int,
+        metadata: Optional[dict[str, Any]] = None,
+        since: Optional[float] = None,
     ) -> list[dict[str, Any]]:
         # Clamp to ``[0, MAX_LIST_LIMIT]`` rather than
         # ``[1, MAX_LIST_LIMIT]``: a caller asking for ``limit=0``
@@ -312,6 +323,53 @@ class LocalArtifactStore(ArtifactBackend):
         if producer:
             clauses.append("producer = ?")
             params.append(producer)
+        if metadata:
+            # Subset/AND match pushed into SQLite: one
+            # ``json_extract`` equality per filter pair. The JSON
+            # path is a bound parameter (never string-interpolated
+            # into SQL), and the key is double-quoted *within* that
+            # path (``$."<key>"``) so it's always read as a single
+            # literal object member — a key containing ``.``/``[]``
+            # can't be reinterpreted as a nested-path traversal.
+            # This keeps the local match flat and consistent with
+            # the bus-side ``metadata_matches`` (literal-key) even
+            # for direct backend callers that bypass the handler's
+            # key-charset validation. ``limit`` then applies over
+            # the *matched* set, not a pre-filter page.
+            #
+            # Booleans need ``json_type`` rather than a value
+            # equality: ``json_extract`` coerces a JSON ``true`` to
+            # the integer ``1`` (and ``false`` to ``0``), so a plain
+            # ``= ?`` would conflate ``{"k": true}`` with ``{"k":
+            # 1}``. Match the JSON type for bools, and for genuine
+            # numbers exclude JSON booleans from the equality so a
+            # ``0``/``1`` filter doesn't pick up ``false``/``true``.
+            # Mirrors the bus-side ``_scalar_eq`` guard.
+            for key, value in metadata.items():
+                path = _json_member_path(key)
+                if isinstance(value, bool):
+                    clauses.append("json_type(metadata, ?) = ?")
+                    params.append(path)
+                    params.append("true" if value else "false")
+                elif isinstance(value, (int, float)):
+                    clauses.append(
+                        "json_extract(metadata, ?) = ? "
+                        "AND json_type(metadata, ?) NOT IN ('true', 'false')"
+                    )
+                    params.append(path)
+                    params.append(value)
+                    params.append(path)
+                else:
+                    clauses.append("json_extract(metadata, ?) = ?")
+                    params.append(path)
+                    params.append(value)
+        if since is not None:
+            # ``created_at`` is stored as a zero-padded ISO-8601 UTC
+            # string (``strftime('%Y-%m-%dT%H:%M:%fZ', 'now')``), so a
+            # lexical ``>=`` against an identically-formatted cutoff
+            # is a correct chronological comparison.
+            clauses.append("created_at >= ?")
+            params.append(_epoch_to_iso(since))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._lock:
             conn = self._connect()
@@ -567,6 +625,67 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
                 # forensics.
                 out[json_field] = {} if json_field == "metadata" else []
     return out
+
+
+def _json_member_path(key: str) -> str:
+    """Build a SQLite JSON path that reads ``key`` as one literal member.
+
+    Double-quoting the key (``$."<key>"``) forces SQLite's JSON
+    path parser to treat ``.``/``[``/``]`` as ordinary characters
+    of the member name rather than path syntax, so the match stays
+    flat regardless of the key's contents.
+
+    A literal double quote in the key has no representation in this
+    syntax: SQLite's JSON-path parser does *not* honor ``""`` as an
+    escaped quote (it terminates the quoted member at the first
+    ``"`` and the remainder is a parse error / silent ``NULL``).
+    Rather than emit a path that can never match, reject such a key
+    so the caller gets a clean error envelope. The agent handler
+    already constrains keys to ``[A-Za-z0-9_-]+``, so this only
+    guards direct backend callers that bypass that validation.
+    """
+    if '"' in key:
+        raise ValueError(
+            "metadata key may not contain a double quote: "
+            "SQLite JSON paths can't represent it"
+        )
+    return '$."' + key + '"'
+
+
+def _epoch_to_iso(ts: float) -> str:
+    """Format a ``since`` epoch cutoff as a millisecond ISO-8601 string.
+
+    Matches the millisecond-precision UTC shape that SQLite's
+    ``strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`` writes into
+    ``created_at``, so the resulting string orders lexically the
+    same way the stored values do and ``created_at >= ?`` is a
+    correct chronological cutoff.
+
+    Sub-millisecond precision is rounded **up** to the next whole
+    millisecond. The cutoff is inclusive (``>=``) and stored rows
+    are millisecond-precision, so flooring a fractional cutoff (e.g.
+    ``…00.1239Z``) to ``…00.123Z`` would admit rows stamped exactly
+    ``…00.123Z`` even though they predate the request. Ceiling to
+    ``…00.124Z`` keeps the inclusive comparison exact (``timedelta``
+    carries cleanly across second/minute boundaries when the
+    millisecond rolls over from ``999``).
+
+    Raises ``ValueError`` for a non-finite or out-of-range ``ts``.
+    The agent handler normalizes ``since`` through ``parse_timestamp``
+    (which already rejects these), but a direct backend caller that
+    bypasses it would otherwise hit a raw ``OverflowError`` / ``OSError``
+    from ``fromtimestamp`` — ``list()`` catches ``ValueError`` and turns
+    it into a structured error envelope, so re-raising as ``ValueError``
+    keeps that path consistent with the rest of the store.
+    """
+    try:
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError("since is out of the representable timestamp range") from exc
+    sub_ms = dt.microsecond % 1000
+    if sub_ms:
+        dt += timedelta(microseconds=1000 - sub_ms)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
 def _clamp_max_chars(max_chars: int) -> int:

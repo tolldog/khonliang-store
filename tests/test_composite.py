@@ -183,6 +183,22 @@ async def test_each_read_method_falls_through_independently():
 
 
 @pytest.mark.asyncio
+async def test_list_forwards_metadata_and_since_to_both_sides():
+    """Composite must thread the metadata / since predicates to
+    both the local and fallback backends so each filters its own
+    rows."""
+    local = _Recorder("local", {"list": [{"id": "art_local_1"}]})
+    fallback = _Recorder("fallback", {"list": [{"id": "art_bus_1"}]})
+    composite = CompositeArtifactBackend(local=local, fallback=fallback)
+    await composite.list(limit=10, metadata={"fr_id": "fr_x"}, since=1772323200.0)
+    for rec in (local, fallback):
+        op, kwargs = rec.calls[0]
+        assert op == "list"
+        assert kwargs["metadata"] == {"fr_id": "fr_x"}
+        assert kwargs["since"] == 1772323200.0
+
+
+@pytest.mark.asyncio
 async def test_list_unions_local_first_then_fallback():
     local = _Recorder("local", {"list": [{"id": "art_local_1"}, {"id": "art_local_2"}]})
     fallback = _Recorder("fallback", {"list": [{"id": "art_bus_1"}, {"id": "art_bus_2"}]})

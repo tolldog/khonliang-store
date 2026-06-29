@@ -12,7 +12,7 @@ import json
 import httpx
 import pytest
 
-from store.artifacts import BusBackedArtifactStore
+from store.artifacts import BusBackedArtifactStore, metadata_matches
 
 
 def _make_backend(handler):
@@ -61,6 +61,23 @@ def make_handler(http_log):
     return _make
 
 
+# -- metadata_matches ---------------------------------------------------------
+
+
+def test_metadata_matches_keeps_bool_distinct_from_int():
+    """``True``/``1`` and ``False``/``0`` must not collapse — bool is
+    an int subclass in Python, so a naive ``==`` would conflate them
+    and break scalar equality on the bus-backed path."""
+    assert metadata_matches({"flag": True}, {"flag": True})
+    assert not metadata_matches({"flag": 1}, {"flag": True})
+    assert not metadata_matches({"flag": True}, {"flag": 1})
+    assert metadata_matches({"flag": 1}, {"flag": 1})
+    assert not metadata_matches({"flag": 0}, {"flag": False})
+    assert metadata_matches({"flag": False}, {"flag": False})
+    # genuine numbers still compare across int/float
+    assert metadata_matches({"n": 1}, {"n": 1.0})
+
+
 # -- list ---------------------------------------------------------------------
 
 
@@ -84,6 +101,119 @@ async def test_list_passes_filters_and_strips_trailing_slash(http_log, make_hand
         "producer": "dev",
         "limit": "5",
     }
+
+
+@pytest.mark.asyncio
+async def test_list_applies_metadata_filter_client_side(http_log, make_handler):
+    """The bus REST surface can't push down the predicate, so the
+    backend filters the fetched page by metadata client-side."""
+    page = [
+        {"id": "art_a", "metadata": {"fr_id": "fr_x"}},
+        {"id": "art_b", "metadata": {"fr_id": "fr_y"}},
+        {"id": "art_c", "metadata": {}},
+    ]
+    backend, client = _make_backend(make_handler(page))
+    try:
+        result = await backend.list(metadata={"fr_id": "fr_x"})
+    finally:
+        await client.aclose()
+    assert [r["id"] for r in result] == ["art_a"]
+    # metadata/since are NOT sent to the bus (it'd ignore them) —
+    # only the columns the REST endpoint understands.
+    assert set(http_log[0]["params"]) == {
+        "session_id", "kind", "producer", "limit",
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_applies_since_filter_client_side(make_handler):
+    page = [
+        {"id": "art_old", "created_at": "2026-01-01T00:00:00Z"},
+        {"id": "art_new", "created_at": "2026-06-01T00:00:00Z"},
+    ]
+    backend, client = _make_backend(make_handler(page))
+    try:
+        result = await backend.list(since=1772323200.0)  # 2026-03-01
+    finally:
+        await client.aclose()
+    assert [r["id"] for r in result] == ["art_new"]
+
+
+@pytest.mark.asyncio
+async def test_list_overfetches_from_bus_when_filtering(http_log, make_handler):
+    """``limit`` bounds the *filtered* set, not the bus page.
+
+    Regression: the bus can't push down the predicate, so sending
+    the caller's small ``limit`` to the bus would truncate the page
+    before filtering and hide matches that sit past it. The backend
+    must over-fetch (up to the bus clamp) and only then slice.
+    """
+    # The only metadata match sits *after* the caller's limit of 1,
+    # so a pre-filter truncation to limit=1 would drop it entirely.
+    page = [
+        {"id": "art_a", "metadata": {"fr_id": "fr_y"}},
+        {"id": "art_b", "metadata": {"fr_id": "fr_y"}},
+        {"id": "art_c", "metadata": {"fr_id": "fr_x"}},
+    ]
+    backend, client = _make_backend(make_handler(page))
+    try:
+        result = await backend.list(metadata={"fr_id": "fr_x"}, limit=1)
+    finally:
+        await client.aclose()
+    assert [r["id"] for r in result] == ["art_c"]
+    # The bus was asked for the clamp (100), not the caller's 1.
+    assert http_log[0]["params"]["limit"] == "100"
+
+
+@pytest.mark.asyncio
+async def test_list_filtered_result_is_sliced_to_limit(make_handler):
+    """Over-fetching must not blow past the caller's budget: the
+    filtered set is still clipped to ``limit``."""
+    page = [{"id": f"art_{i}", "metadata": {"k": "v"}} for i in range(5)]
+    backend, client = _make_backend(make_handler(page))
+    try:
+        result = await backend.list(metadata={"k": "v"}, limit=2)
+    finally:
+        await client.aclose()
+    assert [r["id"] for r in result] == ["art_0", "art_1"]
+
+
+@pytest.mark.asyncio
+async def test_list_negative_limit_does_not_misslice_filtered(http_log, make_handler):
+    """A negative ``limit`` must clamp to an empty result (matching
+    local/composite), not slice ``filtered[:-1]`` into an
+    all-but-last page — and must not even round-trip the bus."""
+    page = [{"id": f"art_{i}", "metadata": {"k": "v"}} for i in range(3)]
+    backend, client = _make_backend(make_handler(page))
+    try:
+        result = await backend.list(metadata={"k": "v"}, limit=-1)
+    finally:
+        await client.aclose()
+    assert result == []
+    assert http_log == []  # short-circuited before any HTTP call
+
+
+@pytest.mark.asyncio
+async def test_list_zero_limit_short_circuits(http_log, make_handler):
+    backend, client = _make_backend(make_handler([{"id": "art_a"}]))
+    try:
+        result = await backend.list(limit=0)
+    finally:
+        await client.aclose()
+    assert result == []
+    assert http_log == []
+
+
+@pytest.mark.asyncio
+async def test_list_unfiltered_passes_caller_limit(http_log, make_handler):
+    """No filter → the page *is* the result, so the caller's limit
+    is forwarded to the bus unchanged (no needless over-fetch)."""
+    backend, client = _make_backend(make_handler([{"id": "art_a"}]))
+    try:
+        await backend.list(limit=7)
+    finally:
+        await client.aclose()
+    assert http_log[0]["params"]["limit"] == "7"
 
 
 @pytest.mark.asyncio

@@ -13,8 +13,8 @@ from typing import Any, Optional
 import pytest
 from khonliang_bus.testing import AgentTestHarness
 
-from store.agent import StoreAgent, _parse_artifact_refs
-from store.artifacts import ArtifactBackend, ListResult
+from store.agent import StoreAgent, _parse_artifact_refs, _parse_metadata_filter
+from store.artifacts import ArtifactBackend, ListResult, parse_timestamp
 from store.viewer import ArtifactRef
 from store.viewer import server as viewer_server
 
@@ -298,7 +298,10 @@ async def test_artifact_list_threads_filters(harness, backend):
     assert result == {"artifacts": [{"id": "art_a"}, {"id": "art_b"}]}
     assert backend.calls == [(
         "list",
-        {"session_id": "s1", "kind": "tool_result", "producer": "dev", "limit": 5},
+        {
+            "session_id": "s1", "kind": "tool_result", "producer": "dev",
+            "limit": 5, "metadata": None, "since": None,
+        },
     )]
 
 
@@ -323,6 +326,123 @@ async def test_artifact_list_passes_error_envelope_through(harness, backend):
     backend.response = {"error": "bus returned HTTP 500"}
     result = await harness.call("artifact_list", {})
     assert result == {"error": "bus returned HTTP 500"}
+
+
+@pytest.mark.asyncio
+async def test_artifact_list_threads_metadata_and_since(harness, backend):
+    """The handler parses metadata + since and threads them to the
+    backend as a dict / epoch float."""
+    backend.response = []
+    await harness.call("artifact_list", {
+        "kind": "reviewer_artifact_review",
+        "metadata": {"fr_id": "fr_x"},
+        "since": "2026-03-01T00:00:00Z",
+    })
+    op, kwargs = backend.calls[0]
+    assert op == "list"
+    assert kwargs["metadata"] == {"fr_id": "fr_x"}
+    assert kwargs["since"] == pytest.approx(1772323200.0)
+
+
+@pytest.mark.asyncio
+async def test_artifact_list_accepts_json_encoded_metadata(harness, backend):
+    """A bus client passing metadata as a JSON string still parses."""
+    backend.response = []
+    await harness.call("artifact_list", {"metadata": '{"fr_id": "fr_x"}'})
+    _, kwargs = backend.calls[0]
+    assert kwargs["metadata"] == {"fr_id": "fr_x"}
+
+
+@pytest.mark.asyncio
+async def test_artifact_list_rejects_non_scalar_metadata_value(harness, backend):
+    """Nested/array metadata values return a structured error, not
+    a crash, and don't reach the backend."""
+    backend.response = []
+    result = await harness.call(
+        "artifact_list", {"metadata": {"fr_id": ["a", "b"]}},
+    )
+    assert "error" in result
+    assert "scalar" in result["error"]
+    assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_artifact_list_rejects_bad_since(harness, backend):
+    backend.response = []
+    result = await harness.call("artifact_list", {"since": "not-a-time"})
+    assert "error" in result
+    assert backend.calls == []
+
+
+# -- metadata-filter / timeframe parsing ------------------------------------
+
+
+def test_parse_metadata_filter_absent_returns_none():
+    assert _parse_metadata_filter(None) is None
+    assert _parse_metadata_filter("") is None
+    assert _parse_metadata_filter({}) is None
+
+
+def test_parse_metadata_filter_accepts_scalars():
+    out = _parse_metadata_filter({"a": "x", "n": 2, "b": True})
+    assert out == {"a": "x", "n": 2, "b": True}
+
+
+def test_parse_metadata_filter_rejects_non_object():
+    with pytest.raises(ValueError):
+        _parse_metadata_filter("[1, 2]")
+    with pytest.raises(ValueError):
+        _parse_metadata_filter("not json")
+
+
+def test_parse_metadata_filter_rejects_path_shaped_key():
+    with pytest.raises(ValueError):
+        _parse_metadata_filter({"a.b": "x"})
+
+
+def test_parse_metadata_filter_rejects_null_value():
+    with pytest.raises(ValueError):
+        _parse_metadata_filter({"a": None})
+
+
+def test_parse_timestamp_forms():
+    assert parse_timestamp(None) is None
+    assert parse_timestamp("") is None
+    assert parse_timestamp(1772323200) == 1772323200.0
+    assert parse_timestamp("1772323200") == 1772323200.0
+    assert parse_timestamp("2026-03-01T00:00:00Z") == pytest.approx(1772323200.0)
+    # Naive ISO is assumed UTC (matches how created_at is stamped).
+    assert parse_timestamp("2026-03-01") == pytest.approx(1772323200.0)
+    # ISO-8601 *basic* format (no separators) must parse as a date,
+    # not be misread as the epoch 20260301.0 (≈1970) by float().
+    assert parse_timestamp("20260301") == pytest.approx(1772323200.0)
+    # A real 10-digit epoch string is not valid ISO, so it still
+    # falls through to the numeric branch unchanged.
+    assert parse_timestamp("1772323200") == 1772323200.0
+
+
+def test_parse_timestamp_rejects_garbage_and_bool():
+    with pytest.raises(ValueError):
+        parse_timestamp("nope")
+    with pytest.raises(ValueError):
+        parse_timestamp(True)
+
+
+def test_parse_timestamp_rejects_non_finite():
+    """nan / inf parse as floats but aren't meaningful cutoffs and
+    would overflow datetime.fromtimestamp in the local store."""
+    for bad in (float("nan"), float("inf"), float("-inf"), "nan", "inf", "1e400"):
+        with pytest.raises(ValueError):
+            parse_timestamp(bad)
+
+
+def test_parse_timestamp_rejects_out_of_range_epoch():
+    """Finite but unrepresentable epochs (1e20) must be rejected
+    here, not deferred to a datetime.fromtimestamp overflow inside
+    the local store (which is outside the sqlite3.Error envelope)."""
+    for bad in (1e20, -1e20, "1e20"):
+        with pytest.raises(ValueError):
+            parse_timestamp(bad)
 
 
 # -- artifact_metadata --------------------------------------------------------
