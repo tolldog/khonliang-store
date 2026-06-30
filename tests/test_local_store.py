@@ -16,6 +16,7 @@ from store.local_store import (
     LocalArtifactStore,
     MAX_ARTIFACT_BYTES,
     MAX_GREP_MATCHES,
+    MAX_GREP_PATTERN_LEN,
     MAX_LIST_LIMIT,
 )
 
@@ -319,6 +320,36 @@ async def test_list_metadata_bool_not_conflated_with_int(backend):
     assert {a["title"] for a in await backend.list(metadata={"flag": 0})} == {
         "IntZero"
     }
+
+
+@pytest.mark.asyncio
+async def test_list_metadata_null_matches_json_null(backend):
+    """A ``None`` filter must match a stored JSON null — and ONLY a
+    JSON null, not a missing member. This keeps the SQLite backend in
+    parity with the bus-side ``metadata_matches``; ``json_extract = NULL``
+    would never match, so the predicate uses ``json_type = 'null'``.
+    """
+    await backend.create(
+        kind="r", title="HasNull", content="x", metadata={"opt": None},
+    )
+    await backend.create(
+        kind="r", title="HasValue", content="x", metadata={"opt": "set"},
+    )
+    await backend.create(
+        kind="r", title="Missing", content="x", metadata={"other": 1},
+    )
+    hits = await backend.list(metadata={"opt": None})
+    assert {a["title"] for a in hits} == {"HasNull"}
+
+
+@pytest.mark.asyncio
+async def test_list_metadata_oversized_int_returns_envelope(backend):
+    """A direct/composite caller bypassing the skill parser can still
+    hand the backend an out-of-range integer. It must degrade to a
+    structured error envelope, not let OverflowError escape."""
+    out = await backend.list(metadata={"n": 10 ** 100})
+    assert isinstance(out, dict)
+    assert "error" in out
 
 
 @pytest.mark.asyncio
@@ -660,6 +691,82 @@ async def test_grep_invalid_regex_returns_error(backend):
     payload = await backend.grep(created["id"], pattern="[")
     assert "error" in payload
     assert "invalid regex" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_grep_redos_pattern_does_not_hang(backend):
+    """A catastrophic-backtracking pattern over an adversarial body
+    must not wedge the to_thread worker. Under the stdlib ``re``
+    engine ``(?:a|a)*$`` over ``"a"*N + "!"`` runs unbounded; the
+    ``regex``-module ``timeout=`` guard converts it into a structured
+    error well inside the per-line budget. The assertion that the
+    whole call returns at all (pytest would otherwise hang) is the
+    real regression check.
+    """
+    body = "a" * 80 + "!"
+    created = await backend.create(kind="note", title="t", content=body)
+    payload = await backend.grep(created["id"], pattern=r"(?:a|a)*$")
+    # Either it completed fast (no catastrophic blowup) or the timeout
+    # guard fired — both are acceptable; an escaped exception / hang is
+    # not. If the guard fired we get a structured error envelope.
+    assert "error" not in payload or "timed out" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_grep_pattern_too_long_rejected(backend):
+    created = await backend.create(kind="note", title="t", content="abc")
+    payload = await backend.grep(
+        created["id"], pattern="a" * (MAX_GREP_PATTERN_LEN + 1),
+    )
+    assert "error" in payload
+    assert "too long" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_grep_large_cheap_artifact_counts_fully(backend):
+    """A large but cheap-to-scan body must return the FULL match
+    count. The per-line ReDoS timeout only fires on a catastrophic
+    line, never on legitimate cheap content, so the count is exact.
+    """
+    body = "\n".join("foo" for _ in range(50_000))
+    created = await backend.create(kind="note", title="t", content=body)
+    payload = await backend.grep(created["id"], pattern=r"foo", max_matches=0)
+    assert "error" not in payload
+    assert payload["matches"] == 50_000
+    assert payload["returned_matches"] == 0
+
+
+@pytest.mark.asyncio
+async def test_grep_is_line_oriented_no_cross_line_match(backend):
+    """grep must match strictly within a line (parity with the
+    per-line bus backend). A pattern that spans a line break — a
+    literal ``\\n`` or a greedy ``(?s).*`` — must not produce a
+    cross-line hit; a within-line match on the same body still counts.
+    """
+    created = await backend.create(
+        kind="note", title="t", content="foo\nbar\nbaz",
+    )
+    # Cross-line literal: never matches under line-oriented grep.
+    spanning = await backend.grep(created["id"], pattern=r"foo\nbar")
+    assert spanning["matches"] == 0
+    # Greedy DOTALL stays bounded to the line it starts on.
+    greedy = await backend.grep(created["id"], pattern=r"(?s)o.*")
+    assert greedy["matches"] == 1
+
+
+@pytest.mark.asyncio
+async def test_grep_high_line_count_does_not_false_timeout(backend):
+    """A body that is large in *line count* (not regex complexity)
+    must scan cleanly and return the full count. There is no
+    whole-scan wall-clock cap (only a per-line backtracking timeout),
+    so high line count alone never produces a false error. Mirrors
+    codex's ``"\\n" * N`` regression case at a test-friendly size.
+    """
+    body = "x\n" * 300_000  # 300k short lines, trivial pattern
+    created = await backend.create(kind="note", title="t", content=body)
+    payload = await backend.grep(created["id"], pattern=r"x", max_matches=0)
+    assert "error" not in payload
+    assert payload["matches"] == 300_000
 
 
 @pytest.mark.asyncio

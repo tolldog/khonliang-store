@@ -22,10 +22,11 @@ import asyncio
 import hashlib
 import json
 import logging
-import re
 import sqlite3
 import threading
 import uuid
+
+import regex
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -47,6 +48,32 @@ MAX_ARTIFACT_BYTES = 10 * 1024 * 1024  # 10 MiB
 MAX_GREP_MATCHES = 100
 MAX_GREP_CONTEXT_LINES = 50
 MAX_HEAD_TAIL_LINES = 1000
+
+# ReDoS guard rail for ``grep``. The caller supplies the pattern, so a
+# pathological regex (``(a+)+$``) over an adversarial line can wedge the
+# ``asyncio.to_thread`` worker *uncancellably* under the stdlib ``re``
+# engine — a single such line hangs forever. We match through the
+# third-party ``regex`` module instead, which honours a ``timeout=``
+# that genuinely raises ``TimeoutError`` mid-backtrack, and apply it
+# per line. This keeps grep exactly line-oriented (each line is matched
+# as its own string, identical to the old per-line ``re.search`` — no
+# whole-body scan that could match across line breaks) while bounding
+# any single line to ``GREP_MATCH_TIMEOUT_S``.
+#
+# Note on the aggregate: per-line timeout bounds each line, so total
+# time is at most (line count) x ``GREP_MATCH_TIMEOUT_S``. Line count is
+# itself bounded by ``MAX_ARTIFACT_BYTES`` (10 MiB), so the worst case
+# is finite. We deliberately do NOT add a whole-scan wall-clock cap: a
+# cap over the per-line loop would false-fail legitimate high-line-count
+# artifacts (a 10 MiB body of short lines carries fixed per-call
+# overhead that can exceed any fixed budget) without preventing a
+# determined adversary from staying just under it. The infinite-hang
+# fix — the actual reported bug — is fully delivered by the per-line
+# timeout; a crafted multi-hundred-thousand-line artifact of
+# catastrophic lines remains slow-but-finite, an accepted residual for
+# an internal, trusted-producer artifact store.
+MAX_GREP_PATTERN_LEN = 1000      # reject absurdly long patterns up front
+GREP_MATCH_TIMEOUT_S = 1.0       # per-line backtracking budget
 
 
 _SCHEMA = """
@@ -298,6 +325,13 @@ class LocalArtifactStore(ArtifactBackend):
             # double quote) surfaces as a clean error envelope rather
             # than crashing the skill outside the sqlite3.Error guard.
             return {"error": str(exc)}
+        except OverflowError:
+            # A metadata integer larger than signed 64 bits can't be
+            # bound into SQLite. The skill parser rejects these up
+            # front, but a direct / composite caller can still reach
+            # here — degrade to the same structured envelope rather
+            # than letting OverflowError escape.
+            return {"error": "metadata integer value out of range"}
 
     def _sync_list(
         self, session_id: str, kind: str, producer: str, limit: int,
@@ -347,7 +381,19 @@ class LocalArtifactStore(ArtifactBackend):
             # Mirrors the bus-side ``_scalar_eq`` guard.
             for key, value in metadata.items():
                 path = _json_member_path(key)
-                if isinstance(value, bool):
+                if value is None:
+                    # A ``None`` filter means "this member is JSON
+                    # null". SQL ``json_extract(...) = NULL`` is never
+                    # true (NULL compares unknown), so a naive ``= ?``
+                    # would silently match nothing here while the
+                    # bus-side ``metadata_matches`` matches a stored
+                    # null — a backend divergence. Match the JSON type
+                    # instead; a *missing* member yields ``json_type``
+                    # NULL (not the string ``'null'``) and correctly
+                    # does not match.
+                    clauses.append("json_type(metadata, ?) = 'null'")
+                    params.append(path)
+                elif isinstance(value, bool):
                     clauses.append("json_type(metadata, ?) = ?")
                     params.append(path)
                     params.append("true" if value else "false")
@@ -489,6 +535,15 @@ class LocalArtifactStore(ArtifactBackend):
             )
         except sqlite3.Error as exc:
             return self._store_error_envelope("grep", exc)
+        except (regex.error, TimeoutError, ValueError) as exc:
+            # Defense in depth: ``_sync_grep`` converts these into
+            # ``{"error": ...}`` itself, but a pathological-pattern
+            # failure must never escape the structured envelope the
+            # way the (sibling-bundle) uncaught ``OverflowError`` did.
+            logger.warning(
+                "grep guard caught %s: %s", type(exc).__name__, exc,
+            )
+            return {"error": "grep failed: pattern too expensive or invalid"}
 
     def _sync_grep(
         self, artifact_id: str, pattern: str,
@@ -496,9 +551,20 @@ class LocalArtifactStore(ArtifactBackend):
     ) -> dict[str, Any]:
         if not pattern:
             return {"error": "pattern is required"}
+        if len(pattern) > MAX_GREP_PATTERN_LEN:
+            return {
+                "error": (
+                    f"pattern too long (max {MAX_GREP_PATTERN_LEN} chars)"
+                )
+            }
+        # Compile via the ``regex`` module (not stdlib ``re``) so the
+        # per-line ``timeout=`` below can interrupt catastrophic
+        # backtracking. No flags: each line is matched as its own
+        # string, exactly as the old ``re.search`` did. See the
+        # ReDoS-guard note on the constants.
         try:
-            regex = re.compile(pattern)
-        except re.error as exc:
+            compiled = regex.compile(pattern)
+        except regex.error as exc:
             return {"error": f"invalid regex pattern: {exc}"}
         meta = self._sync_metadata(artifact_id)
         if meta is None:
@@ -519,7 +585,20 @@ class LocalArtifactStore(ArtifactBackend):
         blocks: list[str] = []
         matches = 0
         for idx, line in enumerate(lines):
-            if not regex.search(line):
+            # Per-line ``timeout`` bounds a single catastrophic line to
+            # ``GREP_MATCH_TIMEOUT_S`` instead of hanging forever; a
+            # blown budget surfaces as a structured error, never a
+            # silent partial. Line-oriented matching is preserved.
+            try:
+                hit = compiled.search(line, timeout=GREP_MATCH_TIMEOUT_S)
+            except TimeoutError:
+                return {
+                    "error": (
+                        "grep timed out: pattern too expensive over "
+                        "this artifact; narrow the pattern"
+                    )
+                }
+            if not hit:
                 continue
             matches += 1
             if len(blocks) < cap:
