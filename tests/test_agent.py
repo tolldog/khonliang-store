@@ -405,6 +405,23 @@ def test_parse_metadata_filter_rejects_null_value():
         _parse_metadata_filter({"a": None})
 
 
+def test_parse_metadata_filter_rejects_oversized_int():
+    # A value beyond signed-64-bit can't be bound into SQLite; the
+    # parser rejects it up front so it surfaces as a structured error
+    # attributed to the bad input rather than an OverflowError escaping
+    # the backend envelope.
+    with pytest.raises(ValueError):
+        _parse_metadata_filter({"n": 10 ** 100})
+    with pytest.raises(ValueError):
+        _parse_metadata_filter({"n": -(10 ** 100)})
+
+
+def test_parse_metadata_filter_accepts_max_int64():
+    # The boundary value itself must still be accepted.
+    out = _parse_metadata_filter({"hi": 2 ** 63 - 1, "lo": -(2 ** 63)})
+    assert out == {"hi": 2 ** 63 - 1, "lo": -(2 ** 63)}
+
+
 def test_parse_timestamp_forms():
     assert parse_timestamp(None) is None
     assert parse_timestamp("") is None

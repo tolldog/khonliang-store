@@ -1255,6 +1255,15 @@ def _parse_metadata_filter(raw: Any) -> Optional[dict[str, Any]]:
             raise ValueError(
                 "metadata filter values must be scalars (str, number, bool)"
             )
+        # Integers are bound straight into SQLite, which only holds
+        # signed 64-bit values. A larger magnitude raises OverflowError
+        # deep in the bound-param path — reject it here so the failure
+        # is attributed to the bad input rather than escaping the
+        # backend's structured-error envelope.
+        if isinstance(val, int) and not (-(2 ** 63) <= val < 2 ** 63):
+            raise ValueError(
+                "metadata filter integer values must fit in signed 64 bits"
+            )
     return value
 
 

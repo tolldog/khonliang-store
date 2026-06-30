@@ -211,6 +211,46 @@ async def test_list_unions_local_first_then_fallback():
 
 
 @pytest.mark.asyncio
+async def test_list_union_reorders_newest_first_across_backends():
+    """The combined local+fallback set must be globally newest-first.
+    Appending fallback after local does not interleave by time, so a
+    bus artifact created between two local ones would otherwise sort
+    below both. ``artifact_migrate_from_bus`` preserves ``created_at``,
+    making cross-backend timestamps directly comparable.
+    """
+    local = _Recorder("local", {"list": [
+        {"id": "L1", "created_at": "2026-01-03T00:00:00.000000Z"},
+        {"id": "L2", "created_at": "2026-01-01T00:00:00.000000Z"},
+    ]})
+    fallback = _Recorder("fallback", {"list": [
+        {"id": "B1", "created_at": "2026-01-02T00:00:00.000000Z"},
+    ]})
+    composite = CompositeArtifactBackend(local=local, fallback=fallback)
+    result = await composite.list(limit=10)
+    assert [item["id"] for item in result] == ["L1", "B1", "L2"]
+
+
+@pytest.mark.asyncio
+async def test_list_union_orders_across_timestamp_precisions():
+    """The local store stamps fractional seconds while the bus uses
+    second precision; a raw-string sort misorders them within the same
+    second (``.5Z`` sorts before ``Z`` lexically). The merge must
+    compare on parsed epoch so a strictly-newer local row in the same
+    second still wins over a bus row.
+    """
+    local = _Recorder("local", {"list": [
+        # 0.5 s past the minute — strictly newer than the bus row below.
+        {"id": "L_newer", "created_at": "2026-01-01T00:00:00.500000Z"},
+    ]})
+    fallback = _Recorder("fallback", {"list": [
+        {"id": "B_older", "created_at": "2026-01-01T00:00:00Z"},
+    ]})
+    composite = CompositeArtifactBackend(local=local, fallback=fallback)
+    result = await composite.list(limit=10)
+    assert [item["id"] for item in result] == ["L_newer", "B_older"]
+
+
+@pytest.mark.asyncio
 async def test_list_dedups_by_id_with_local_winning():
     """An artifact present on both sides (post-migration) must
     show up exactly once, with the local-side row taking
@@ -355,18 +395,28 @@ async def test_list_overfetches_fallback_to_compensate_for_dups():
 
 
 @pytest.mark.asyncio
-async def test_list_skips_fallback_when_local_already_filled_budget():
-    """When the local side already returns ``limit`` rows, the
-    composite must not waste a round trip on the bus — the
-    fallback contributes only when the local side underfilled.
+async def test_list_consults_fallback_even_when_local_fills_budget():
+    """Even when local returns ``limit`` rows, the fallback MUST be
+    queried: if the local rows are all older than a newer un-migrated
+    bus artifact, the newest-first contract requires that bus row to
+    surface and displace the oldest local row. (An earlier
+    optimization short-circuited here and silently dropped newer bus
+    rows — a contract violation under the merge-sort.)
     """
-    local = _Recorder("local", {"list": [{"id": f"art_l_{i}"} for i in range(5)]})
-    fallback = _Recorder("fallback", {"list": [{"id": "art_b_1"}]})
+    local = _Recorder("local", {"list": [
+        {"id": f"L{i}", "created_at": f"2026-01-0{i + 1}T00:00:00Z"}
+        for i in range(3)  # L0..L2 dated Jan 1..3 (older)
+    ]})
+    fallback = _Recorder("fallback", {"list": [
+        {"id": "B_newest", "created_at": "2026-01-09T00:00:00Z"},
+    ]})
     composite = CompositeArtifactBackend(local=local, fallback=fallback)
-    result = await composite.list(limit=5)
-    assert isinstance(result, list)
-    assert len(result) == 5
-    assert fallback.calls == []  # fallback never queried
+    result = await composite.list(limit=3)
+    assert fallback.calls != []  # fallback IS queried
+    ids = [item["id"] for item in result]
+    assert ids[0] == "B_newest"  # newest overall floats to the top
+    assert len(ids) == 3
+    assert "L0" not in ids  # oldest local row displaced
 
 
 @pytest.mark.asyncio

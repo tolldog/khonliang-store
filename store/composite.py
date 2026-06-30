@@ -19,8 +19,28 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from store.artifacts import ArtifactBackend, ListResult
+from store.artifacts import ArtifactBackend, ListResult, parse_timestamp
 from store.local_store import MAX_LIST_LIMIT
+
+
+def _created_at_key(item: dict[str, Any]) -> float:
+    """Sort key for newest-first ordering across backends.
+
+    The local store stamps ``created_at`` with fractional seconds
+    (``...%fZ``) while the bus/fallback side uses second precision
+    (``...Z``). A raw-string sort is NOT chronological across those
+    formats — lexically ``2026-01-01T00:00:00.5Z`` sorts *before*
+    ``2026-01-01T00:00:00Z`` (``.`` < ``Z``), so a fallback row could
+    jump ahead of a strictly-newer local row in the same second.
+    Parse to epoch seconds for a true chronological compare; an
+    absent / unparseable stamp sorts last (``-inf``) under the
+    ``reverse=True`` sort rather than raising.
+    """
+    try:
+        epoch = parse_timestamp(item.get("created_at"))
+    except (ValueError, TypeError):
+        return float("-inf")
+    return epoch if epoch is not None else float("-inf")
 
 
 logger = logging.getLogger(__name__)
@@ -264,10 +284,16 @@ class CompositeArtifactBackend(ArtifactBackend):
         )
         if isinstance(local, dict):
             return local
-        if len(local) >= limit:
-            # Local side already filled the budget; no need to
-            # round-trip the fallback.
-            return local[:limit]
+        # NOTE: no "local already filled the limit" fast path. Once the
+        # merged result is re-sorted newest-first (below), short-circuiting
+        # on ``len(local) >= limit`` would be incorrect: the local DB can
+        # hold ``limit`` *older* rows while the fallback still has newer
+        # un-migrated artifacts, and skipping the fallback would silently
+        # drop those newer rows from the top of the page. Correctness of
+        # the newest-first contract requires always consulting the
+        # fallback until migration empties it. (The fallback is the
+        # deprecated bus REST surface; it returns quickly / empty once
+        # operators have run artifact_migrate_from_bus.)
         # Over-fetch the fallback by ``len(local)`` to compensate
         # for rows that will be discarded as duplicates of
         # local-side ids. Cap at ``MAX_LIST_LIMIT`` (shared with
@@ -321,6 +347,15 @@ class CompositeArtifactBackend(ArtifactBackend):
             # the same id twice.
             seen_ids.add(item_id)
             merged.append(item)
-            if len(merged) >= limit:
-                break
+        # Re-sort the combined set newest-first before slicing. Each
+        # backend returns its own rows in ``created_at``-desc order,
+        # but appending one list after the other does NOT interleave
+        # them — a fallback artifact created after a local one would
+        # otherwise sort *below* it, violating the ``ArtifactBackend``
+        # newest-first contract (``artifact_migrate_from_bus``
+        # preserves ``created_at``, so cross-backend timestamps are
+        # directly comparable). Sort is stable, so rows with equal /
+        # missing ``created_at`` keep their local-before-fallback
+        # order. Slice to ``limit`` only after the global ordering.
+        merged.sort(key=_created_at_key, reverse=True)
         return merged[:limit]
