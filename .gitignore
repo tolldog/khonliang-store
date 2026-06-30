@@ -11,3 +11,6 @@ __pycache__/
 config.yaml
 data/
 logs/
+
+# Real, machine-specific deploy manifest (khonliang-deploy); commit deploy.yaml.example only.
+deploy.yaml
